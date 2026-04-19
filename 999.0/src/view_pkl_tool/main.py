@@ -14,9 +14,10 @@ import subprocess
 import sys
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
-from PySide6.QtCore import QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QThread, QTimer, Qt, Signal, Slot
+from PySide6.QtUiTools import QUiLoader
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -27,11 +28,12 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFileDialog,
     QFrame,
     QHeaderView,
-    QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QPushButton,
@@ -43,9 +45,57 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QTreeWidget,
     QTreeWidgetItem,
+    QTreeWidgetItemIterator,
     QVBoxLayout,
     QWidget,
 )
+
+_QW = TypeVar("_QW", bound=QWidget)
+
+
+def _require_ui_child(parent: QWidget, typ: type[_QW], name: str) -> _QW:
+    w = parent.findChild(typ, name)
+    if w is None:
+        raise RuntimeError(
+            f"UI 缺少控件 {name!r}（类型 {getattr(typ, '__name__', typ)}）"
+        )
+    return w
+
+
+def _apply_ui_layout_after_load(central: QWidget) -> None:
+    """补回从 .ui 去掉的 stretch / 分割尺寸（避免旧 uic 不识别 layoutStretch 等属性）。"""
+    root_ly = central.layout()
+    if isinstance(root_ly, QVBoxLayout) and root_ly.count() >= 2:
+        root_ly.setStretch(0, 0)
+        root_ly.setStretch(1, 1)
+
+    browse = central.findChild(QWidget, "browseTab")
+    if browse is not None:
+        bv = browse.layout()
+        if isinstance(bv, QVBoxLayout) and bv.count() >= 3:
+            bv.setStretch(0, 0)
+            bv.setStretch(1, 0)
+            bv.setStretch(2, 1)
+
+    hist_col = central.findChild(QWidget, "historyColumn")
+    if hist_col is not None:
+        hv = hist_col.layout()
+        if isinstance(hv, QVBoxLayout) and hv.count() >= 3:
+            hv.setStretch(0, 0)
+            hv.setStretch(1, 1)
+            hv.setStretch(2, 0)
+
+    log_tab = central.findChild(QWidget, "logTab")
+    if log_tab is not None:
+        lv = log_tab.layout()
+        if isinstance(lv, QVBoxLayout) and lv.count() >= 2:
+            lv.setStretch(0, 0)
+            lv.setStretch(1, 1)
+
+    sp = central.findChild(QSplitter, "mainSplitter")
+    if sp is not None:
+        sp.setSizes([220, 680, 360])
+
 
 _MAX_CHILDREN = 200
 _DETAIL_MAX_CHARS = 50_000
@@ -55,6 +105,13 @@ _HISTORY_MAX = 20
 _LOG_FILE = Path(r"D:\Temp\pkl") / "pkl_viewer.log"
 
 _LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+# 树搜索：下拉「字段名」= 键列去重；后台线程遍历整棵对象图（含未展开节点），匹配后定位到树节点。
+_SEARCH_ALL_FIELDS = "【全部字段】"
+_SEARCH_DEFAULT_FIELD = "name"
+_DEEP_SEARCH_BATCH = 256
+_DEEP_SEARCH_YIELD_NODES = 6000
+_KEYS_COLLECT_YIELD_NODES = 8000
 
 
 class GenericPickleObject:
@@ -286,6 +343,64 @@ def _add_children(parent: QTreeWidgetItem, value: Any) -> None:
         count += 1
 
 
+def _row_matches_search(field: str, needle: str, key: str, value: Any) -> bool:
+    """与树节点一致的匹配规则：指定字段时键列须等于 field；否则在三列文本中搜子串。"""
+    k0 = key
+    k1 = _node_label(value)
+    k2 = _type_label(value)
+    if field != _SEARCH_ALL_FIELDS and k0 != field:
+        return False
+    n = needle.strip().lower()
+    if not n:
+        return field != _SEARCH_ALL_FIELDS
+    blob = f"{k0}\n{k1}\n{k2}".lower()
+    return n in blob
+
+
+def _tree_expand_lazy_placeholder(tree: QTreeWidget, item: QTreeWidgetItem) -> bool:
+    """若 item 下仅有懒加载占位子节点，则展开为真实子项。返回是否执行了展开。"""
+    if item.childCount() != 1:
+        return False
+    child = item.child(0)
+    if child.data(0, Qt.ItemDataRole.UserRole) != _PLACEHOLDER:
+        return False
+    item.removeChild(child)
+    value = item.data(0, Qt.ItemDataRole.UserRole)
+    if value is not None and value != _PLACEHOLDER:
+        tree.setUpdatesEnabled(False)
+        _add_children(item, value)
+        tree.setUpdatesEnabled(True)
+    return True
+
+
+def _tree_expand_one_more_chunk(tree: QTreeWidget, item: QTreeWidgetItem) -> bool:
+    """展开 item 下第一个「… 还有更多」分页块。返回是否执行了展开。"""
+    for i in range(item.childCount()):
+        ch = item.child(i)
+        meta = ch.data(0, Qt.ItemDataRole.UserRole)
+        if isinstance(meta, tuple) and len(meta) == 3 and meta[0] == "__more__":
+            _, parent_value, offset = meta
+            item.removeChild(ch)
+            tree.setUpdatesEnabled(False)
+            count = 0
+            for key, child_val in _iter_children(parent_value):
+                if count < offset:
+                    count += 1
+                    continue
+                if count >= offset + _MAX_CHILDREN:
+                    total = _child_count(parent_value)
+                    remaining = total - count
+                    more = QTreeWidgetItem(item, ["...", f"{remaining} more items", ""])
+                    more.setForeground(1, QColor("#888"))
+                    more.setData(0, Qt.ItemDataRole.UserRole, ("__more__", parent_value, count))
+                    break
+                _make_node(item, key, child_val)
+                count += 1
+            tree.setUpdatesEnabled(True)
+            return True
+    return False
+
+
 def _make_node(parent: QTreeWidgetItem | QTreeWidget, key: str, value: Any) -> QTreeWidgetItem:
     label = _node_label(value)
     tname = _type_label(value)
@@ -305,6 +420,138 @@ def _make_node(parent: QTreeWidgetItem | QTreeWidget, key: str, value: Any) -> Q
         if not isinstance(value, GenericPickleObject):
             node.setForeground(1, QColor("#4ec9b0"))
     return node
+
+
+class _CollectFieldKeysThread(QThread):
+    """后台遍历对象图，收集所有出现过的子键名（用于字段下拉框）。"""
+
+    keys_delta = Signal(int, object)
+    finished_ok = Signal(int)
+
+    def __init__(self, root: Any, gen_at_start: int, get_tree_gen: Any) -> None:
+        super().__init__()
+        self._root = root
+        self._gen_at_start = gen_at_start
+        self._get_tree_gen = get_tree_gen
+
+    def run(self) -> None:
+        if not _is_container(self._root):
+            if self._get_tree_gen() == self._gen_at_start and not self.isInterruptionRequested():
+                self.finished_ok.emit(self._gen_at_start)
+            return
+        acc: set[str] = set()
+        seen: set[int] = set()
+        n = 0
+
+        def cancelled() -> bool:
+            return self.isInterruptionRequested() or self._get_tree_gen() != self._gen_at_start
+
+        def walk(val: Any) -> None:
+            nonlocal n
+            if cancelled():
+                return
+            if not _is_container(val):
+                return
+            vid = id(val)
+            if vid in seen:
+                return
+            seen.add(vid)
+            for key, child in _iter_children(val):
+                if cancelled():
+                    return
+                acc.add(key)
+                n += 1
+                if n % _KEYS_COLLECT_YIELD_NODES == 0:
+                    self.keys_delta.emit(self._gen_at_start, set(acc))
+                    acc.clear()
+                if _is_container(child):
+                    walk(child)
+
+        try:
+            walk(self._root)
+            if acc and not cancelled():
+                self.keys_delta.emit(self._gen_at_start, set(acc))
+            if not cancelled():
+                self.finished_ok.emit(self._gen_at_start)
+        except Exception:
+            traceback.print_exc()
+            _log_exception("后台收集字段名失败")
+
+
+class _DeepSearchThread(QThread):
+    """后台深度遍历对象图，按字段名 + 子串规则收集匹配节点的路径。"""
+
+    paths_batch = Signal(int, object)
+    finished_ok = Signal(int, int)
+    failed = Signal(int, str)
+
+    def __init__(
+        self,
+        root: Any,
+        field: str,
+        needle: str,
+        job_gen: int,
+        get_job_gen: Any,
+    ) -> None:
+        super().__init__()
+        self._root = root
+        self._field = field
+        self._needle = needle
+        self._job_gen_at_start = job_gen
+        self._get_job_gen = get_job_gen
+
+    def run(self) -> None:
+        if not _is_container(self._root):
+            if self._get_job_gen() == self._job_gen_at_start and not self.isInterruptionRequested():
+                self.finished_ok.emit(self._job_gen_at_start, 0)
+            return
+        batch: list[tuple[str, ...]] = []
+        total = 0
+        nodes = 0
+        seen: set[int] = set()
+
+        def cancelled() -> bool:
+            return self.isInterruptionRequested() or self._get_job_gen() != self._job_gen_at_start
+
+        def flush() -> None:
+            nonlocal batch
+            if batch and not cancelled():
+                self.paths_batch.emit(self._job_gen_at_start, list(batch))
+            batch = []
+
+        def walk(val: Any, path: tuple[str, ...]) -> None:
+            nonlocal total, nodes, batch
+            if cancelled():
+                return
+            if not _is_container(val):
+                return
+            vid = id(val)
+            if vid in seen:
+                return
+            seen.add(vid)
+            for key, child in _iter_children(val):
+                if cancelled():
+                    return
+                nodes += 1
+                if nodes % _DEEP_SEARCH_YIELD_NODES == 0:
+                    flush()
+                sub = path + (key,)
+                if _row_matches_search(self._field, self._needle, key, child):
+                    batch.append(sub)
+                    total += 1
+                    if len(batch) >= _DEEP_SEARCH_BATCH:
+                        flush()
+                if _is_container(child):
+                    walk(child, sub)
+
+        try:
+            walk(self._root, ("root",))
+            flush()
+            if not cancelled():
+                self.finished_ok.emit(self._job_gen_at_start, total)
+        except Exception as e:
+            traceback.print_exc()
+            self.failed.emit(self._job_gen_at_start, str(e))
 
 
 class _HistoryRow(QWidget):
@@ -450,7 +697,18 @@ class PklViewer(QMainWindow):
         self._loading_path = ""
         self._history = _History()
         self._history_selected_row: _HistoryRow | None = None
-        self._build_ui()
+        self._search_matches: list[QTreeWidgetItem] = []
+        self._search_index: int = 0
+        self._tree_async_gen: int = 0
+        self._search_job_gen: int = 0
+        self._keys_thread: _CollectFieldKeysThread | None = None
+        self._deep_search_thread: _DeepSearchThread | None = None
+        self._all_field_keys_from_obj: set[str] = set()
+        self._search_default_name_pending: bool = True
+        self._search_combo_user_picked: bool = False
+        self._deep_search_running: bool = False
+        self._search_first_nav_pending: bool = False
+        self._load_ui()
         self._refresh_history_list()
         if initial_file and Path(initial_file).exists():
             self._load_file(initial_file)
@@ -491,140 +749,344 @@ class PklViewer(QMainWindow):
             w = w.parentWidget()
         return None
 
-    def _build_ui(self) -> None:
-        central = QWidget()
+    def _load_ui(self) -> None:
+        """从 view_pkl_tool.ui 加载界面；布局与样式在 .ui 中维护。"""
+        ui_path = Path(__file__).resolve().parent / "view_pkl_tool.ui"
+        if not ui_path.is_file():
+            raise RuntimeError(f"UI 文件不存在: {ui_path}")
+        raw = QByteArray(ui_path.read_bytes())
+        buf = QBuffer()
+        buf.setData(raw)
+        if not buf.open(QIODevice.OpenModeFlag.ReadOnly):
+            raise RuntimeError(f"无法读取 UI 内容: {ui_path}")
+        loader = QUiLoader()
+        try:
+            central = loader.load(buf, None)
+        finally:
+            buf.close()
+        if central is None:
+            raise RuntimeError(
+                f"加载 UI 失败: {ui_path} — {loader.errorString()}"
+            )
         self.setCentralWidget(central)
-        root_layout = QVBoxLayout(central)
-        root_layout.setContentsMargins(8, 8, 8, 4)
-        root_layout.setSpacing(6)
+        _apply_ui_layout_after_load(central)
 
-        toolbar = QHBoxLayout()
-        self._path_label = QLabel("未加载文件")
-        self._path_label.setStyleSheet("color: #aaa; font-size: 12px;")
-        open_btn = QPushButton("打开 PKL...")
-        open_btn.setFixedWidth(100)
-        open_btn.clicked.connect(self._on_open)
-        reload_btn = QPushButton("重新加载")
-        reload_btn.setFixedWidth(80)
-        reload_btn.clicked.connect(self._on_reload)
-        toolbar.addWidget(open_btn)
-        toolbar.addWidget(reload_btn)
-        toolbar.addWidget(self._path_label, stretch=1)
-        root_layout.addLayout(toolbar)
-
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-
-        history_widget = QWidget()
-        history_layout = QVBoxLayout(history_widget)
-        history_layout.setContentsMargins(0, 0, 0, 0)
-        history_layout.setSpacing(3)
-        history_label = QLabel("最近打开")
-        history_label.setStyleSheet("color: #888; font-size: 11px; padding: 2px 4px;")
-        self._history_scroll = QScrollArea()
-        self._history_scroll.setWidgetResizable(True)
-        self._history_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        self._path_label = _require_ui_child(central, QLabel, "pathLabel")
+        _require_ui_child(central, QPushButton, "openButton").clicked.connect(self._on_open)
+        _require_ui_child(central, QPushButton, "reloadButton").clicked.connect(
+            self._on_reload
         )
-        self._history_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self._history_scroll.setStyleSheet(
-            "QScrollArea { background: #252526; border: none; }"
+        _require_ui_child(central, QPushButton, "refreshMetaButton").clicked.connect(
+            self._on_refresh_log_and_file_meta
         )
-        self._history_inner = QWidget()
-        self._history_inner.setStyleSheet("background: #252526;")
-        self._history_layout = QVBoxLayout(self._history_inner)
-        self._history_layout.setContentsMargins(1, 1, 1, 1)
-        self._history_layout.setSpacing(0)
-        self._history_scroll.setWidget(self._history_inner)
-        self._history_inner.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self._history_inner.customContextMenuRequested.connect(self._on_history_context_menu)
-        remove_btn = QPushButton("从列表移除")
-        remove_btn.setStyleSheet("font-size: 11px; padding: 3px;")
-        remove_btn.clicked.connect(self._on_history_remove)
-        history_layout.addWidget(history_label)
-        history_layout.addWidget(self._history_scroll, stretch=1)
-        history_layout.addWidget(remove_btn)
-        splitter.addWidget(history_widget)
+        _require_ui_child(central, QPushButton, "removeFromListButton").clicked.connect(
+            self._on_history_remove
+        )
 
-        self._tree = QTreeWidget()
-        self._tree.setHeaderLabels(["键", "值", "类型"])
-        header = self._tree.header()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self._tree.setAlternatingRowColors(True)
-        self._tree.setUniformRowHeights(True)
-        self._tree.setStyleSheet(
-            """
-            QTreeWidget { background: #1e1e1e; color: #d4d4d4; border: none; font-size: 13px; }
-            QTreeWidget::item:selected { background: #264f78; }
-            QHeaderView::section { background: #2d2d2d; color: #ccc; padding: 4px; border: none; }
-        """
+        self._main_tabs = _require_ui_child(central, QTabWidget, "mainTabs")
+        self._tree = _require_ui_child(central, QTreeWidget, "treeWidget")
+        self._detail = _require_ui_child(central, QTextEdit, "detailText")
+        self._history_scroll = _require_ui_child(central, QScrollArea, "historyScroll")
+        self._history_inner = _require_ui_child(central, QWidget, "historyInner")
+        inner_layout = self._history_inner.layout()
+        if not isinstance(inner_layout, QVBoxLayout):
+            raise RuntimeError("UI: historyInner 应为 QVBoxLayout")
+        self._history_layout = inner_layout
+        self._history_inner.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
         )
+        self._history_inner.customContextMenuRequested.connect(
+            self._on_history_context_menu
+        )
+
+        self._search_field_combo = _require_ui_child(
+            central, QComboBox, "searchFieldCombo"
+        )
+        self._search_field_combo.activated.connect(self._on_search_field_user_activated)
+        self._search_line = _require_ui_child(central, QLineEdit, "searchLine")
+        self._search_line.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Fixed,
+        )
+        self._search_line.returnPressed.connect(self._on_tree_search_next)
+        self._search_btn = _require_ui_child(central, QPushButton, "searchButton")
+        self._search_btn.clicked.connect(self._on_tree_search)
+        self._search_next_btn = _require_ui_child(
+            central, QPushButton, "searchNextButton"
+        )
+        self._search_next_btn.clicked.connect(self._on_tree_search_next)
+
+        self._log_view = _require_ui_child(central, QTextEdit, "logView")
+        log_hint = _require_ui_child(central, QLabel, "logHintLabel")
+        log_hint.setText(f"日志文件：{_LOG_FILE}")
+
+        hdr = self._tree.header()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self._tree.itemExpanded.connect(self._on_item_expanded)
         self._tree.currentItemChanged.connect(self._on_item_selected)
-        splitter.addWidget(self._tree)
-
-        self._detail = QTextEdit()
-        self._detail.setReadOnly(True)
         self._detail.setFont(QFont("Consolas", 12))
-        self._detail.setStyleSheet(
-            "background: #1e1e1e; color: #ce9178; border: none; padding: 6px;"
-        )
-        splitter.addWidget(self._detail)
-        # Keep detail pane narrower by default to prioritize tree browsing.
-        splitter.setSizes([220, 680, 360])
-
-        browse_page = QWidget()
-        browse_layout = QVBoxLayout(browse_page)
-        browse_layout.setContentsMargins(0, 0, 0, 0)
-        browse_layout.setSpacing(4)
-        browse_refresh_row = QHBoxLayout()
-        refresh_info_btn = QPushButton("刷新")
-        refresh_info_btn.setFixedWidth(72)
-        refresh_info_btn.setToolTip(
-            "重新读取运行日志，并更新「最近打开」中的文件大小与修改时间"
-        )
-        refresh_info_btn.clicked.connect(self._on_refresh_log_and_file_meta)
-        browse_refresh_row.addWidget(refresh_info_btn)
-        browse_refresh_row.addStretch(1)
-        browse_layout.addLayout(browse_refresh_row)
-        browse_layout.addWidget(splitter)
-
-        log_page = QWidget()
-        log_layout = QVBoxLayout(log_page)
-        log_layout.setContentsMargins(0, 4, 0, 0)
-        log_layout.setSpacing(4)
-        log_hint = QLabel(f"日志文件：{_LOG_FILE}")
-        log_hint.setStyleSheet("color: #666; font-size: 10px; padding: 2px 4px;")
-        log_hint.setWordWrap(True)
-        self._log_view = QTextEdit()
-        self._log_view.setReadOnly(True)
         self._log_view.setFont(QFont("Consolas", 10))
-        self._log_view.setStyleSheet(
-            "background: #1e1e1e; color: #b5cea8; border: none; padding: 6px;"
-        )
-        log_layout.addWidget(log_hint)
-        log_layout.addWidget(self._log_view, stretch=1)
-
-        self._main_tabs = QTabWidget()
-        self._main_tabs.setDocumentMode(True)
-        self._main_tabs.setStyleSheet(
-            """
-            QTabWidget::pane { border: none; top: -1px; }
-            QTabBar::tab { background: #2d2d2d; color: #aaa; padding: 6px 16px; margin-right: 2px; }
-            QTabBar::tab:selected { background: #1e1e1e; color: #e0e0e0; }
-            QTabBar::tab:hover:!selected { background: #353535; color: #ccc; }
-        """
-        )
-        self._main_tabs.addTab(browse_page, "查看")
-        self._main_tabs.addTab(log_page, "日志")
-        root_layout.addWidget(self._main_tabs, stretch=1)
 
         self._reload_app_log_view()
 
         self._status = QStatusBar()
         self.setStatusBar(self._status)
         self.setStyleSheet("QMainWindow { background: #252526; }")
+
+    def _stop_keys_thread(self) -> None:
+        t = self._keys_thread
+        if t is None:
+            return
+        if t.isRunning():
+            t.requestInterruption()
+            t.wait(500)
+        self._keys_thread = None
+
+    def _stop_deep_search_thread(self) -> None:
+        t = self._deep_search_thread
+        if t is None:
+            return
+        if t.isRunning():
+            t.requestInterruption()
+            t.wait(500)
+        self._deep_search_thread = None
+
+    @Slot(int)
+    def _on_search_field_user_activated(self, _index: int) -> None:
+        self._search_combo_user_picked = True
+
+    def _maybe_select_default_search_field(self) -> None:
+        if self._search_combo_user_picked or not self._search_default_name_pending:
+            return
+        combo = self._search_field_combo
+        idx = combo.findText(_SEARCH_DEFAULT_FIELD, Qt.MatchFlag.MatchExactly)
+        if idx < 0:
+            return
+        combo.blockSignals(True)
+        combo.setCurrentIndex(idx)
+        combo.blockSignals(False)
+        self._search_default_name_pending = False
+
+    def _start_collect_keys_thread(self, obj: Any) -> None:
+        self._stop_keys_thread()
+        if not _is_container(obj):
+            self._rebuild_search_field_combo()
+            self._maybe_select_default_search_field()
+            return
+        gen = self._tree_async_gen
+        th = _CollectFieldKeysThread(obj, gen, lambda: self._tree_async_gen)
+        self._keys_thread = th
+        th.keys_delta.connect(self._on_field_keys_delta)
+        th.finished_ok.connect(self._on_field_keys_finished)
+        th.start()
+
+    @Slot(int, object)
+    def _on_field_keys_delta(self, gen: int, delta: object) -> None:
+        if gen != self._tree_async_gen or not isinstance(delta, set):
+            return
+        self._all_field_keys_from_obj.update(str(x) for x in delta)
+        self._rebuild_search_field_combo()
+
+    @Slot(int)
+    def _on_field_keys_finished(self, gen: int) -> None:
+        if gen != self._tree_async_gen:
+            return
+        self._rebuild_search_field_combo()
+        self._maybe_select_default_search_field()
+
+    def _find_direct_child_for_search(
+        self, parent: QTreeWidgetItem, key: str
+    ) -> QTreeWidgetItem | None:
+        tree = self._tree
+        _tree_expand_lazy_placeholder(tree, parent)
+        while True:
+            for i in range(parent.childCount()):
+                ch = parent.child(i)
+                if ch.data(0, Qt.ItemDataRole.UserRole) == _PLACEHOLDER:
+                    continue
+                meta = ch.data(0, Qt.ItemDataRole.UserRole)
+                if isinstance(meta, tuple) and len(meta) == 3 and meta[0] == "__more__":
+                    continue
+                if ch.text(0) == key:
+                    return ch
+            if not _tree_expand_one_more_chunk(tree, parent):
+                return None
+
+    def _find_tree_item_for_path(self, path: tuple[str, ...]) -> QTreeWidgetItem | None:
+        tree = self._tree
+        if tree.topLevelItemCount() == 0:
+            return None
+        item = tree.topLevelItem(0)
+        if item is None:
+            return None
+        if not path or item.text(0) != path[0]:
+            return None
+        for seg in path[1:]:
+            nxt = self._find_direct_child_for_search(item, seg)
+            if nxt is None:
+                return None
+            item = nxt
+        return item
+
+    def _rebuild_search_field_combo(self) -> None:
+        """合并后台收集的键名与当前树已加载节点的键列，填入字段名下拉框。"""
+        cur = self._search_field_combo.currentText()
+        self._search_field_combo.blockSignals(True)
+        self._search_field_combo.clear()
+        self._search_field_combo.addItem(_SEARCH_ALL_FIELDS)
+        keys: set[str] = set(self._all_field_keys_from_obj)
+        it = QTreeWidgetItemIterator(self._tree)
+        while it.value():
+            item = it.value()
+            k0 = item.text(0).strip()
+            if k0 and k0 != "..." and item.data(0, Qt.ItemDataRole.UserRole) != _PLACEHOLDER:
+                keys.add(k0)
+            it += 1
+        for k in sorted(keys, key=lambda s: (s.lower(), s)):
+            self._search_field_combo.addItem(k)
+        self._search_field_combo.blockSignals(False)
+        idx = self._search_field_combo.findText(cur, Qt.MatchFlag.MatchExactly)
+        if idx >= 0:
+            self._search_field_combo.setCurrentIndex(idx)
+        elif not self._search_combo_user_picked:
+            self._maybe_select_default_search_field()
+
+    def _tree_item_matches(self, field: str, needle: str, item: QTreeWidgetItem) -> bool:
+        """与后台深度搜索使用同一套规则（有绑定值时用对象算标签）。"""
+        meta = item.data(0, Qt.ItemDataRole.UserRole)
+        if meta == _PLACEHOLDER:
+            return False
+        if isinstance(meta, tuple) and len(meta) == 3 and meta[0] == "__more__":
+            return False
+        k0 = item.text(0)
+        k1 = item.text(1)
+        k2 = item.text(2)
+        if k0.strip() == "" and k1.strip() == "" and k2.strip() == "":
+            return False
+        if meta is not None and meta != _PLACEHOLDER:
+            return _row_matches_search(field, needle, k0, meta)
+        if field != _SEARCH_ALL_FIELDS and k0 != field:
+            return False
+        n = needle.strip().lower()
+        if not n:
+            return field != _SEARCH_ALL_FIELDS
+        blob = f"{k0}\n{k1}\n{k2}".lower()
+        return n in blob
+
+    def _ensure_tree_item_visible(self, item: QTreeWidgetItem) -> None:
+        chain: list[QTreeWidgetItem] = []
+        p = item.parent()
+        while p is not None:
+            chain.append(p)
+            p = p.parent()
+        for x in reversed(chain):
+            x.setExpanded(True)
+        self._tree.scrollToItem(item)
+        self._tree.setCurrentItem(item)
+
+    def _goto_search_match(self, index: int) -> None:
+        if not self._search_matches:
+            return
+        index %= len(self._search_matches)
+        self._search_index = index
+        self._ensure_tree_item_visible(self._search_matches[index])
+
+    def _on_tree_search(self) -> None:
+        if self._current_obj is None:
+            self._status.showMessage("请先加载 PKL 文件", 3000)
+            return
+        field = self._search_field_combo.currentText()
+        needle = self._search_line.text()
+        if field == _SEARCH_ALL_FIELDS and not needle.strip():
+            self._status.showMessage("选择「全部字段」时请至少输入一个搜索子串", 3500)
+            return
+
+        self._stop_deep_search_thread()
+        self._search_job_gen += 1
+        job_gen = self._search_job_gen
+        self._search_matches.clear()
+        self._search_index = 0
+        self._search_first_nav_pending = True
+
+        th = _DeepSearchThread(
+            self._current_obj,
+            field,
+            needle,
+            job_gen,
+            lambda: self._search_job_gen,
+        )
+        self._deep_search_thread = th
+        self._deep_search_running = True
+        th.paths_batch.connect(self._on_deep_search_paths_batch)
+        th.finished_ok.connect(self._on_deep_search_finished)
+        th.failed.connect(self._on_deep_search_failed)
+        th.start()
+        self._status.showMessage("深度搜索中（后台遍历整棵对象）…", 0)
+
+    def _on_tree_search_next(self) -> None:
+        if self._search_matches:
+            self._search_index = (self._search_index + 1) % len(self._search_matches)
+            self._goto_search_match(self._search_index)
+            return
+        if self._deep_search_running:
+            self._status.showMessage("深度搜索尚未完成，请稍候再试「下一个」", 2500)
+            return
+        self._on_tree_search()
+
+    @Slot(int, object)
+    def _on_deep_search_paths_batch(self, gen: int, paths: object) -> None:
+        if gen != self._search_job_gen or not isinstance(paths, list):
+            return
+        resolved: list[QTreeWidgetItem] = []
+        for p in paths:
+            if not isinstance(p, tuple):
+                continue
+            path = tuple(str(x) for x in p)
+            it = self._find_tree_item_for_path(path)
+            if it is not None:
+                resolved.append(it)
+        if not resolved:
+            return
+        self._search_matches.extend(resolved)
+        if self._search_first_nav_pending:
+            self._search_first_nav_pending = False
+            self._goto_search_match(0)
+        n = len(self._search_matches)
+        self._status.showMessage(f"深度搜索中… 已定位 {n} 项（后台继续）", 1500)
+
+    @Slot(int, int)
+    def _on_deep_search_finished(self, gen: int, total: int) -> None:
+        if gen != self._search_job_gen:
+            return
+        self._deep_search_running = False
+        if total == 0:
+            self._status.showMessage("未找到匹配项", 4000)
+            return
+        located = len(self._search_matches)
+        if located == 0:
+            self._status.showMessage(
+                f"对象中共 {total} 处匹配，但无法在树中定位到节点", 6000
+            )
+            return
+        if located < total:
+            self._status.showMessage(
+                f"深度搜索完成：共 {total} 处匹配，已定位 {located} 项；回车或「下一个」跳转",
+                5000,
+            )
+            return
+        self._status.showMessage(
+            f"深度搜索完成，共 {total} 项；回车或「下一个」在已定位项间跳转", 5000
+        )
+
+    @Slot(int, str)
+    def _on_deep_search_failed(self, gen: int, msg: str) -> None:
+        if gen != self._search_job_gen:
+            return
+        self._deep_search_running = False
+        self._status.showMessage(f"深度搜索失败: {msg}", 6000)
+        print(f"[PKL Viewer] 深度搜索失败: {msg}", file=sys.stderr, flush=True)
 
     def _reload_app_log_view(self) -> None:
         """从磁盘加载 pkl_viewer 日志到「日志」标签页（过大则只读尾部）。"""
@@ -669,9 +1131,12 @@ class PklViewer(QMainWindow):
         layout = self._history_layout
         while layout.count():
             li = layout.takeAt(0)
+            if li is None:
+                continue
             w = li.widget()
             if w is not None:
                 w.deleteLater()
+            del li
         for path in self._history.all():
             row = _HistoryRow(path, self)
             missing = not Path(path).exists()
@@ -793,6 +1258,9 @@ class PklViewer(QMainWindow):
             self._load_thread.quit()
             self._load_thread.wait(500)
 
+        self._stop_deep_search_thread()
+        self._stop_keys_thread()
+
         self._history.push(path)
         self._refresh_history_list()
 
@@ -833,6 +1301,15 @@ class PklViewer(QMainWindow):
         self._status.showMessage(f"已加载: {path}  |  类型: {type_name}{suffix}", 0)
 
     def _refresh_tree(self, obj: Any) -> None:
+        self._stop_deep_search_thread()
+        self._stop_keys_thread()
+        self._tree_async_gen += 1
+        self._search_job_gen += 1
+        self._deep_search_running = False
+        self._all_field_keys_from_obj.clear()
+        self._search_combo_user_picked = False
+        self._search_default_name_pending = True
+
         self._tree.setUpdatesEnabled(False)
         self._tree.clear()
         _make_node(self._tree, "root", obj)
@@ -841,42 +1318,18 @@ class PklViewer(QMainWindow):
             root_item = self._tree.topLevelItem(0)
             if root_item is not None:
                 root_item.setExpanded(True)
+        self._search_matches = []
+        self._search_index = 0
+        self._rebuild_search_field_combo()
+        self._maybe_select_default_search_field()
+        self._start_collect_keys_thread(obj)
 
     def _on_item_expanded(self, item: QTreeWidgetItem) -> None:
-        if item.childCount() == 1:
-            child = item.child(0)
-            if child.data(0, Qt.ItemDataRole.UserRole) == _PLACEHOLDER:
-                item.removeChild(child)
-                value = item.data(0, Qt.ItemDataRole.UserRole)
-                if value is not None and value != _PLACEHOLDER:
-                    self._tree.setUpdatesEnabled(False)
-                    _add_children(item, value)
-                    self._tree.setUpdatesEnabled(True)
-                return
-
-        for i in range(item.childCount()):
-            child = item.child(i)
-            meta = child.data(0, Qt.ItemDataRole.UserRole)
-            if isinstance(meta, tuple) and len(meta) == 3 and meta[0] == "__more__":
-                _, parent_value, offset = meta
-                item.removeChild(child)
-                self._tree.setUpdatesEnabled(False)
-                count = 0
-                for key, child_val in _iter_children(parent_value):
-                    if count < offset:
-                        count += 1
-                        continue
-                    if count >= offset + _MAX_CHILDREN:
-                        total = _child_count(parent_value)
-                        remaining = total - count
-                        more = QTreeWidgetItem(item, ["...", f"{remaining} more items", ""])
-                        more.setForeground(1, QColor("#888"))
-                        more.setData(0, Qt.ItemDataRole.UserRole, ("__more__", parent_value, count))
-                        break
-                    _make_node(item, key, child_val)
-                    count += 1
-                self._tree.setUpdatesEnabled(True)
-                break
+        if _tree_expand_lazy_placeholder(self._tree, item):
+            self._rebuild_search_field_combo()
+            return
+        if _tree_expand_one_more_chunk(self._tree, item):
+            self._rebuild_search_field_combo()
 
     def _on_item_selected(self, current: QTreeWidgetItem | None, _prev: QTreeWidgetItem | None) -> None:
         if current is None:

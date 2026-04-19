@@ -1,0 +1,438 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>view_pkl_tool_central</class>
+ <widget class="QWidget" name="centralRoot">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>1300</width>
+    <height>700</height>
+   </rect>
+  </property>
+  <layout class="QVBoxLayout" name="verticalLayout_root">
+   <property name="spacing">
+    <number>6</number>
+   </property>
+   <property name="leftMargin">
+    <number>8</number>
+   </property>
+   <property name="topMargin">
+    <number>8</number>
+   </property>
+   <property name="rightMargin">
+    <number>8</number>
+   </property>
+   <property name="bottomMargin">
+    <number>4</number>
+   </property>
+   <item>
+    <layout class="QHBoxLayout" name="horizontalLayout_toolbar">
+     <property name="spacing">
+      <number>6</number>
+     </property>
+     <item>
+      <widget class="QPushButton" name="openButton">
+       <property name="minimumSize">
+        <size>
+         <width>100</width>
+         <height>0</height>
+        </size>
+       </property>
+       <property name="maximumSize">
+        <size>
+         <width>100</width>
+         <height>16777215</height>
+        </size>
+       </property>
+       <property name="text">
+        <string>打开 PKL...</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="reloadButton">
+       <property name="minimumSize">
+        <size>
+         <width>80</width>
+         <height>0</height>
+        </size>
+       </property>
+       <property name="maximumSize">
+        <size>
+         <width>80</width>
+         <height>16777215</height>
+        </size>
+       </property>
+       <property name="text">
+        <string>重新加载</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <spacer name="horizontalSpacer_toolbar">
+       <property name="orientation">
+        <enum>Qt::Horizontal</enum>
+       </property>
+       <property name="sizeHint" stdset="0">
+        <size>
+         <width>40</width>
+         <height>20</height>
+        </size>
+       </property>
+      </spacer>
+     </item>
+     <item>
+      <widget class="QLabel" name="pathLabel">
+       <property name="text">
+        <string>未加载文件</string>
+       </property>
+       <property name="styleSheet">
+        <string notr="true">color: #aaa; font-size: 12px;</string>
+       </property>
+      </widget>
+     </item>
+    </layout>
+   </item>
+   <item>
+    <widget class="QTabWidget" name="mainTabs">
+     <property name="styleSheet">
+      <string notr="true">QTabWidget::pane { border: none; top: -1px; } QTabBar::tab { background: #2d2d2d; color: #aaa; padding: 6px 16px; margin-right: 2px; } QTabBar::tab:selected { background: #1e1e1e; color: #e0e0e0; } QTabBar::tab:hover { background: #353535; color: #ccc; }</string>
+     </property>
+     <property name="documentMode">
+      <bool>true</bool>
+     </property>
+     <property name="currentIndex">
+      <number>0</number>
+     </property>
+     <widget class="QWidget" name="browseTab">
+      <attribute name="title">
+       <string>查看</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="verticalLayout_browse">
+       <property name="spacing">
+        <number>4</number>
+       </property>
+       <property name="leftMargin">
+        <number>0</number>
+       </property>
+       <property name="topMargin">
+        <number>0</number>
+       </property>
+       <property name="rightMargin">
+        <number>0</number>
+       </property>
+       <property name="bottomMargin">
+        <number>0</number>
+       </property>
+       <item>
+        <layout class="QHBoxLayout" name="horizontalLayout_refresh">
+         <item>
+          <widget class="QPushButton" name="refreshMetaButton">
+           <property name="minimumSize">
+            <size>
+             <width>72</width>
+             <height>0</height>
+            </size>
+           </property>
+           <property name="maximumSize">
+            <size>
+             <width>72</width>
+             <height>16777215</height>
+            </size>
+           </property>
+           <property name="toolTip">
+            <string>重新读取运行日志，并更新「最近打开」中的文件大小与修改时间</string>
+           </property>
+           <property name="text">
+            <string>刷新</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <spacer name="horizontalSpacer_refresh">
+           <property name="orientation">
+            <enum>Qt::Horizontal</enum>
+           </property>
+           <property name="sizeHint" stdset="0">
+            <size>
+             <width>40</width>
+             <height>20</height>
+            </size>
+           </property>
+          </spacer>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="horizontalLayout_search">
+         <property name="spacing">
+          <number>6</number>
+         </property>
+         <item>
+          <widget class="QLabel" name="label_field">
+           <property name="text">
+            <string>字段名</string>
+           </property>
+           <property name="styleSheet">
+            <string notr="true">color: #aaa; font-size: 12px;</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QComboBox" name="searchFieldCombo">
+           <property name="minimumSize">
+            <size>
+             <width>180</width>
+             <height>0</height>
+            </size>
+           </property>
+           <property name="toolTip">
+            <string>字段名来自整棵对象（后台收集）与已展开树节点；默认优先选择「name」。查找在后台遍历全部子节点（含未展开），匹配后自动定位到树中对应项。</string>
+           </property>
+           <property name="styleSheet">
+            <string notr="true">QComboBox { background: #2d2d2d; color: #d4d4d4; padding: 2px 8px; border: 1px solid #3c3c3c; } QComboBox::drop-down { border: none; }</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLabel" name="label_search">
+           <property name="text">
+            <string>搜索</string>
+           </property>
+           <property name="styleSheet">
+            <string notr="true">color: #aaa; font-size: 12px;</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLineEdit" name="searchLine">
+           <property name="placeholderText">
+            <string>子串（不区分大小写）；回车 = 下一个匹配</string>
+           </property>
+           <property name="styleSheet">
+            <string notr="true">QLineEdit { background: #2d2d2d; color: #d4d4d4; border: 1px solid #3c3c3c; padding: 4px 8px; }</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="searchButton">
+           <property name="minimumSize">
+            <size>
+             <width>56</width>
+             <height>0</height>
+            </size>
+           </property>
+           <property name="maximumSize">
+            <size>
+             <width>56</width>
+             <height>16777215</height>
+            </size>
+           </property>
+           <property name="styleSheet">
+            <string notr="true">QPushButton { background: #0e639c; color: #fff; padding: 4px 8px; border: none; } QPushButton:hover { background: #1177bb; }</string>
+           </property>
+           <property name="text">
+            <string>查找</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="searchNextButton">
+           <property name="minimumSize">
+            <size>
+             <width>56</width>
+             <height>0</height>
+            </size>
+           </property>
+           <property name="maximumSize">
+            <size>
+             <width>56</width>
+             <height>16777215</height>
+            </size>
+           </property>
+           <property name="styleSheet">
+            <string notr="true">QPushButton { background: #3c3c3c; color: #e0e0e0; padding: 4px 8px; border: 1px solid #555; } QPushButton:hover { background: #4a4a4a; }</string>
+           </property>
+           <property name="text">
+            <string>下一个</string>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QSplitter" name="mainSplitter">
+         <property name="orientation">
+          <enum>Qt::Horizontal</enum>
+         </property>
+         <property name="childrenCollapsible">
+          <bool>false</bool>
+         </property>
+         <widget class="QWidget" name="historyColumn">
+          <layout class="QVBoxLayout" name="verticalLayout_historyColumn">
+           <property name="spacing">
+            <number>3</number>
+           </property>
+           <property name="leftMargin">
+            <number>0</number>
+           </property>
+           <property name="topMargin">
+            <number>0</number>
+           </property>
+           <property name="rightMargin">
+            <number>0</number>
+           </property>
+           <property name="bottomMargin">
+            <number>0</number>
+           </property>
+           <item>
+            <widget class="QLabel" name="historySectionLabel">
+             <property name="text">
+              <string>最近打开</string>
+             </property>
+             <property name="styleSheet">
+              <string notr="true">color: #888; font-size: 11px; padding: 2px 4px;</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QScrollArea" name="historyScroll">
+             <property name="frameShape">
+              <enum>QFrame::NoFrame</enum>
+             </property>
+             <property name="horizontalScrollBarPolicy">
+              <enum>Qt::ScrollBarAlwaysOff</enum>
+             </property>
+             <property name="widgetResizable">
+              <bool>true</bool>
+             </property>
+             <property name="styleSheet">
+              <string notr="true">QScrollArea { background: #252526; border: none; }</string>
+             </property>
+             <widget class="QWidget" name="historyInner">
+              <property name="styleSheet">
+               <string notr="true">background: #252526;</string>
+              </property>
+              <layout class="QVBoxLayout" name="verticalLayout_historyInner">
+               <property name="spacing">
+                <number>0</number>
+               </property>
+               <property name="leftMargin">
+                <number>1</number>
+               </property>
+               <property name="topMargin">
+                <number>1</number>
+               </property>
+               <property name="rightMargin">
+                <number>1</number>
+               </property>
+               <property name="bottomMargin">
+                <number>1</number>
+               </property>
+              </layout>
+             </widget>
+            </widget>
+           </item>
+           <item>
+            <widget class="QPushButton" name="removeFromListButton">
+             <property name="styleSheet">
+              <string notr="true">font-size: 11px; padding: 3px;</string>
+             </property>
+             <property name="text">
+              <string>从列表移除</string>
+             </property>
+            </widget>
+           </item>
+          </layout>
+         </widget>
+         <widget class="QTreeWidget" name="treeWidget">
+          <property name="alternatingRowColors">
+           <bool>true</bool>
+          </property>
+          <property name="uniformRowHeights">
+           <bool>true</bool>
+          </property>
+          <property name="styleSheet">
+           <string notr="true">QTreeWidget { background: #1e1e1e; color: #d4d4d4; border: none; font-size: 13px; } QTreeWidget::item:selected { background: #264f78; } QHeaderView::section { background: #2d2d2d; color: #ccc; padding: 4px; border: none; }</string>
+          </property>
+          <column>
+           <property name="text">
+            <string>键</string>
+           </property>
+          </column>
+          <column>
+           <property name="text">
+            <string>值</string>
+           </property>
+          </column>
+          <column>
+           <property name="text">
+            <string>类型</string>
+           </property>
+          </column>
+         </widget>
+         <widget class="QTextEdit" name="detailText">
+          <property name="readOnly">
+           <bool>true</bool>
+          </property>
+          <property name="styleSheet">
+           <string notr="true">background: #1e1e1e; color: #ce9178; border: none; padding: 6px;</string>
+          </property>
+         </widget>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+     <widget class="QWidget" name="logTab">
+      <attribute name="title">
+       <string>日志</string>
+      </attribute>
+      <layout class="QVBoxLayout" name="verticalLayout_log">
+       <property name="spacing">
+        <number>4</number>
+       </property>
+       <property name="leftMargin">
+        <number>0</number>
+       </property>
+       <property name="topMargin">
+        <number>4</number>
+       </property>
+       <property name="rightMargin">
+        <number>0</number>
+       </property>
+       <property name="bottomMargin">
+        <number>0</number>
+       </property>
+       <item>
+        <widget class="QLabel" name="logHintLabel">
+         <property name="text">
+          <string>日志文件：</string>
+         </property>
+         <property name="wordWrap">
+          <bool>true</bool>
+         </property>
+         <property name="styleSheet">
+          <string notr="true">color: #666; font-size: 10px; padding: 2px 4px;</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QTextEdit" name="logView">
+         <property name="readOnly">
+          <bool>true</bool>
+         </property>
+         <property name="styleSheet">
+          <string notr="true">background: #1e1e1e; color: #b5cea8; border: none; padding: 6px;</string>
+         </property>
+        </widget>
+       </item>
+      </layout>
+     </widget>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>
