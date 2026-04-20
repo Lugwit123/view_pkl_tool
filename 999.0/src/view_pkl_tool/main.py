@@ -45,7 +45,6 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QTreeWidget,
     QTreeWidgetItem,
-    QTreeWidgetItemIterator,
     QVBoxLayout,
     QWidget,
 )
@@ -708,6 +707,10 @@ class PklViewer(QMainWindow):
         self._search_combo_user_picked: bool = False
         self._deep_search_running: bool = False
         self._search_first_nav_pending: bool = False
+        self._rebuild_combo_timer = QTimer(self)
+        self._rebuild_combo_timer.setSingleShot(True)
+        self._rebuild_combo_timer.setInterval(200)
+        self._rebuild_combo_timer.timeout.connect(self._on_rebuild_combo_timeout)
         self._load_ui()
         self._refresh_history_list()
         if initial_file and Path(initial_file).exists():
@@ -872,7 +875,7 @@ class PklViewer(QMainWindow):
     def _start_collect_keys_thread(self, obj: Any) -> None:
         self._stop_keys_thread()
         if not _is_container(obj):
-            self._rebuild_search_field_combo()
+            self._schedule_rebuild_search_field_combo()
             self._maybe_select_default_search_field()
             return
         gen = self._tree_async_gen
@@ -887,14 +890,22 @@ class PklViewer(QMainWindow):
         if gen != self._tree_async_gen or not isinstance(delta, set):
             return
         self._all_field_keys_from_obj.update(str(x) for x in delta)
-        self._rebuild_search_field_combo()
+        # 下拉框仅由后台键收集驱动更新；不扫描树节点
+        self._schedule_rebuild_search_field_combo()
 
     @Slot(int)
     def _on_field_keys_finished(self, gen: int) -> None:
         if gen != self._tree_async_gen:
             return
-        self._rebuild_search_field_combo()
+        self._schedule_rebuild_search_field_combo()
         self._maybe_select_default_search_field()
+
+    def _schedule_rebuild_search_field_combo(self) -> None:
+        """合并多次触发（展开/后台收集）后再重建，避免频繁全树扫描卡 UI。"""
+        self._rebuild_combo_timer.start()
+
+    def _on_rebuild_combo_timeout(self) -> None:
+        self._rebuild_search_field_combo()
 
     def _find_direct_child_for_search(
         self, parent: QTreeWidgetItem, key: str
@@ -931,19 +942,12 @@ class PklViewer(QMainWindow):
         return item
 
     def _rebuild_search_field_combo(self) -> None:
-        """合并后台收集的键名与当前树已加载节点的键列，填入字段名下拉框。"""
+        """用后台收集到的键名重建字段下拉框（不扫描树，避免展开卡顿）。"""
         cur = self._search_field_combo.currentText()
         self._search_field_combo.blockSignals(True)
         self._search_field_combo.clear()
         self._search_field_combo.addItem(_SEARCH_ALL_FIELDS)
         keys: set[str] = set(self._all_field_keys_from_obj)
-        it = QTreeWidgetItemIterator(self._tree)
-        while it.value():
-            item = it.value()
-            k0 = item.text(0).strip()
-            if k0 and k0 != "..." and item.data(0, Qt.ItemDataRole.UserRole) != _PLACEHOLDER:
-                keys.add(k0)
-            it += 1
         for k in sorted(keys, key=lambda s: (s.lower(), s)):
             self._search_field_combo.addItem(k)
         self._search_field_combo.blockSignals(False)
@@ -1320,16 +1324,15 @@ class PklViewer(QMainWindow):
                 root_item.setExpanded(True)
         self._search_matches = []
         self._search_index = 0
-        self._rebuild_search_field_combo()
+        # 字段名下拉框仅由后台收集线程更新，这里不做重建/扫描
         self._maybe_select_default_search_field()
         self._start_collect_keys_thread(obj)
 
     def _on_item_expanded(self, item: QTreeWidgetItem) -> None:
         if _tree_expand_lazy_placeholder(self._tree, item):
-            self._rebuild_search_field_combo()
             return
         if _tree_expand_one_more_chunk(self._tree, item):
-            self._rebuild_search_field_combo()
+            return
 
     def _on_item_selected(self, current: QTreeWidgetItem | None, _prev: QTreeWidgetItem | None) -> None:
         if current is None:
