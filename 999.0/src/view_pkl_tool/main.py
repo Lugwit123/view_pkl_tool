@@ -28,9 +28,14 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QFrame,
+    QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
@@ -100,6 +105,7 @@ _MAX_CHILDREN = 200
 _DETAIL_MAX_CHARS = 50_000
 _PLACEHOLDER = "__placeholder__"
 _HISTORY_FILE = Path(r"D:\Temp\pkl") / "pkl_viewer_history.json"
+_DETAIL_PRESET_FILE = Path(r"D:\Temp\pkl") / "pkl_viewer_detail_presets.json"
 _HISTORY_MAX = 20
 _LOG_FILE = Path(r"D:\Temp\pkl") / "pkl_viewer.log"
 
@@ -111,6 +117,586 @@ _SEARCH_DEFAULT_FIELD = "name"
 _DEEP_SEARCH_BATCH = 256
 _DEEP_SEARCH_YIELD_NODES = 6000
 _KEYS_COLLECT_YIELD_NODES = 8000
+
+# 右侧“目录树”详情的安全上限，避免一次性渲染过大卡 UI
+_DETAIL_SUBTREE_MAX_NODES = 3000
+_DETAIL_SUBTREE_MAX_DEPTH = 20
+
+# 子树展开下拉：只保留“级数”一个参数
+_DETAIL_SUBTREE_LEVEL_PRESETS: list[str] = [
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "8",
+    "10",
+    "12",
+    "15",
+    "20",
+]
+
+_DEFAULT_DETAIL_PRESETS: list[dict[str, Any]] = [
+    {
+        "name": "常用目录",
+        "show_text": True,
+        "text_mode": "recursive",
+        "show_tree": True,
+        "fields": ["name", "id", "children"],
+        "tree_columns": ["name", "id"],
+    },
+    {
+        "name": "目录详情",
+        "show_text": True,
+        "text_mode": "recursive",
+        "show_tree": True,
+        "fields": ["name", "id", "parent_id", "children"],
+        "tree_columns": ["name", "id"],
+    },
+    {
+        "name": "文本摘要",
+        "show_text": True,
+        "text_mode": "shallow",
+        "show_tree": False,
+        "fields": None,
+        "tree_columns": ["name", "id"],
+    },
+    {
+        "name": "全部字段",
+        "show_text": True,
+        "text_mode": "recursive",
+        "show_tree": True,
+        "fields": None,
+        "tree_columns": ["name", "id"],
+    },
+]
+
+
+def _normalize_field_list(text: str) -> list[str] | None:
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    normalized = (
+        raw.replace("；", ",")
+        .replace(";", ",")
+        .replace("，", ",")
+        .replace("\n", ",")
+        .replace(" ", ",")
+    )
+    fields = [x.strip() for x in normalized.split(",") if x.strip()]
+    if not fields:
+        return None
+    if any(x in ("*", "全部", "all", "ALL") for x in fields):
+        return None
+    result: list[str] = []
+    seen: set[str] = set()
+    for field in fields:
+        if field not in seen:
+            result.append(field)
+            seen.add(field)
+    return result
+
+
+def _field_list_to_text(fields: list[str] | None) -> str:
+    return "*" if fields is None else ",".join(fields)
+
+
+def _normalize_detail_preset(raw: Any) -> dict[str, Any]:
+    src = raw if isinstance(raw, dict) else {}
+    name = str(src.get("name") or "未命名预设").strip() or "未命名预设"
+    text_mode = str(src.get("text_mode") or "recursive").strip().lower()
+    if text_mode not in ("recursive", "shallow"):
+        text_mode = "recursive"
+    tree_columns = _normalize_field_list(_field_list_to_text(src.get("tree_columns")))
+    if not tree_columns:
+        tree_columns = ["name", "id"]
+    return {
+        "name": name,
+        "show_text": bool(src.get("show_text", True)),
+        "text_mode": text_mode,
+        "show_tree": bool(src.get("show_tree", True)),
+        "fields": _normalize_field_list(_field_list_to_text(src.get("fields"))),
+        "tree_columns": tree_columns[:2],
+    }
+
+
+def _clone_default_detail_presets() -> list[dict[str, Any]]:
+    return [_normalize_detail_preset(item) for item in _DEFAULT_DETAIL_PRESETS]
+
+
+class _DetailPresetEditorDialog(QDialog):
+    def __init__(self, parent: QWidget, preset: dict[str, Any]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("编辑完整预设")
+        self.resize(560, 420)
+
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            "完整预设用于任意 PKL 预览：控制文本预览、目录树显示，以及要保留的字段。\n"
+            "字段支持逗号/空格/换行分隔；输入 * 表示不过滤字段。"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        form = QFormLayout()
+        layout.addLayout(form)
+
+        self.name_edit = QLineEdit(str(preset.get("name") or ""))
+        form.addRow("预设名称", self.name_edit)
+
+        self.show_text_check = QCheckBox("显示上方文本预览")
+        self.show_text_check.setChecked(bool(preset.get("show_text", True)))
+        form.addRow("文本预览", self.show_text_check)
+
+        self.text_mode_combo = QComboBox()
+        self.text_mode_combo.addItem("递归 JSON", "recursive")
+        self.text_mode_combo.addItem("摘要", "shallow")
+        idx = self.text_mode_combo.findData(str(preset.get("text_mode") or "recursive"))
+        self.text_mode_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        form.addRow("文本模式", self.text_mode_combo)
+
+        self.show_tree_check = QCheckBox("显示下方目录树")
+        self.show_tree_check.setChecked(bool(preset.get("show_tree", True)))
+        form.addRow("目录树", self.show_tree_check)
+
+        self.fields_edit = QTextEdit()
+        self.fields_edit.setPlaceholderText("例如: name,id,children 或 *")
+        self.fields_edit.setPlainText(_field_list_to_text(preset.get("fields")))
+        self.fields_edit.setMaximumHeight(90)
+        form.addRow("文本字段", self.fields_edit)
+
+        self.tree_columns_edit = QLineEdit(_field_list_to_text(preset.get("tree_columns")))
+        self.tree_columns_edit.setPlaceholderText("例如: name,id")
+        form.addRow("目录树列", self.tree_columns_edit)
+
+        self.delete_requested = False
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        delete_btn = QPushButton("删除预设")
+        buttons.addButton(delete_btn, QDialogButtonBox.ButtonRole.ResetRole)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        delete_btn.clicked.connect(self._on_delete_clicked)
+        layout.addWidget(buttons)
+
+    def _on_delete_clicked(self) -> None:
+        self.delete_requested = True
+        self.accept()
+
+    def build_preset(self) -> dict[str, Any]:
+        return _normalize_detail_preset(
+            {
+                "name": self.name_edit.text(),
+                "show_text": self.show_text_check.isChecked(),
+                "text_mode": self.text_mode_combo.currentData(),
+                "show_tree": self.show_tree_check.isChecked(),
+                "fields": _normalize_field_list(self.fields_edit.toPlainText()),
+                "tree_columns": _normalize_field_list(self.tree_columns_edit.text()),
+            }
+        )
+
+
+def _pick_name_from_multil(m: Any) -> str | None:
+    if not isinstance(m, dict):
+        return None
+    for k in ("zh_cn", "zh-CN", "zh", "zh_CN", "cn", "en", "en_us", "en-US"):
+        v = m.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    for v in m.values():
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def _tree_node_inner_mapping(value: Any) -> dict[str, Any] | None:
+    """提取目录节点的真实字段映射，兼容 __dict__ / _state / 普通对象。"""
+    try:
+        child_map = {str(k): v for k, v in _iter_children(value)}
+    except Exception:
+        child_map = {}
+
+    raw_dict = child_map.get("__dict__")
+    if isinstance(raw_dict, dict):
+        return raw_dict
+
+    raw_state = child_map.get("_state")
+    if isinstance(raw_state, dict):
+        return raw_state
+
+    if isinstance(value, dict):
+        return value
+
+    st = getattr(value, "_state", None)
+    if isinstance(st, dict):
+        return st
+
+    if child_map:
+        return child_map
+    return None
+
+
+def _tree_node_name(value: Any) -> str | None:
+    try:
+        for k, v in _iter_children(value):
+            if k == "name" and isinstance(v, str) and v.strip():
+                return v.strip()
+            if k == "name_multil":
+                nm = _pick_name_from_multil(v)
+                if nm:
+                    return nm
+    except Exception:
+        pass
+
+    inner = _tree_node_inner_mapping(value)
+    if isinstance(inner, dict):
+        nm = inner.get("name")
+        if isinstance(nm, str) and nm.strip():
+            return nm.strip()
+        return _pick_name_from_multil(inner.get("name_multil"))
+
+    nm = getattr(value, "name", None)
+    if isinstance(nm, str) and nm.strip():
+        return nm.strip()
+    return _pick_name_from_multil(getattr(value, "name_multil", None))
+
+
+def _tree_node_children(value: Any) -> list[Any] | None:
+    try:
+        child_v = None
+        cats_v = None
+        for k, v in _iter_children(value):
+            if k == "children":
+                child_v = v
+            elif k == "categories":
+                cats_v = v
+        if isinstance(child_v, list):
+            return child_v
+        if isinstance(cats_v, list):
+            return cats_v
+    except Exception:
+        pass
+
+    inner = _tree_node_inner_mapping(value)
+    if isinstance(inner, dict):
+        ch = inner.get("children")
+        if isinstance(ch, list):
+            return ch
+        ch2 = inner.get("categories")
+        return ch2 if isinstance(ch2, list) else None
+
+    ch = getattr(value, "children", None)
+    if isinstance(ch, list):
+        return ch
+    ch2 = getattr(value, "categories", None)
+    return ch2 if isinstance(ch2, list) else None
+
+
+def _tree_node_id(value: Any) -> str | None:
+    try:
+        for k, v in _iter_children(value):
+            if k == "id" and v is not None:
+                s = str(v).strip()
+                if s:
+                    return s
+    except Exception:
+        pass
+
+    inner = _tree_node_inner_mapping(value)
+    if isinstance(inner, dict):
+        v = inner.get("id")
+        if v is not None:
+            s = str(v).strip()
+            return s or None
+
+    v = getattr(value, "id", None)
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s or None
+
+
+def _object_field_value(value: Any, field_name: str) -> Any:
+    if field_name == "name":
+        return _tree_node_name(value)
+    if field_name == "id":
+        return _tree_node_id(value)
+    if field_name in ("children", "categories"):
+        return _tree_node_children(value)
+
+    try:
+        for k, v in _iter_children(value):
+            if str(k) == field_name:
+                return v
+    except Exception:
+        pass
+
+    inner = _tree_node_inner_mapping(value)
+    if isinstance(inner, dict) and field_name in inner:
+        return inner.get(field_name)
+
+    return getattr(value, field_name, None)
+
+
+def _is_tree_node_like(value: Any) -> bool:
+    """用于详情面板：识别类似 MuseCategoryTreeNodeModel 的目录节点（name + children）。"""
+    try:
+        return _tree_node_name(value) is not None and isinstance(_tree_node_children(value), list)
+    except Exception:
+        return False
+
+
+def _render_name_subtree(
+    root: Any,
+    *,
+    max_depth: int = _DETAIL_SUBTREE_MAX_DEPTH,
+    max_nodes: int = _DETAIL_SUBTREE_MAX_NODES,
+) -> str:
+    """将 name/children 结构渲染为缩进文本树。"""
+    lines: list[str] = []
+    seen: set[int] = set()
+    node_count = 0
+    truncated = False
+
+    def _pick_name_from_multil(m: Any) -> str | None:
+        if not isinstance(m, dict):
+            return None
+        for k in ("zh_cn", "zh-CN", "zh", "zh_CN", "cn", "en", "en_us", "en-US"):
+            v = m.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        for v in m.values():
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return None
+
+    def _get_name(node: Any) -> str:
+        # 通用兜底：通过 _iter_children 抽取（适配 pydantic/降级对象/自定义容器）
+        try:
+            name_v = None
+            multil_v = None
+            for k, v in _iter_children(node):
+                if k == "name":
+                    name_v = v
+                elif k == "name_multil":
+                    multil_v = v
+            if isinstance(name_v, str) and name_v.strip():
+                return name_v.strip()
+            nm2 = _pick_name_from_multil(multil_v)
+            if nm2 is not None:
+                return nm2
+        except Exception:
+            pass
+
+        if isinstance(node, dict):
+            nm = node.get("name")
+            if isinstance(nm, str) and nm.strip():
+                return nm.strip()
+            nm2 = _pick_name_from_multil(node.get("name_multil"))
+            return nm2 if nm2 is not None else "<no-name>"
+        st = getattr(node, "_state", None)
+        if isinstance(st, dict) and "name" in st:
+            nm = st.get("name")
+            if isinstance(nm, str) and nm.strip():
+                return nm.strip()
+            nm2 = _pick_name_from_multil(st.get("name_multil"))
+            return nm2 if nm2 is not None else "<no-name>"
+        nm = getattr(node, "name", None)
+        if isinstance(nm, str) and nm.strip():
+            return nm.strip()
+        nm2 = _pick_name_from_multil(getattr(node, "name_multil", None))
+        return nm2 if nm2 is not None else "<no-name>"
+
+    def _has_meaningful_name(node: Any) -> bool:
+        return _get_name(node) != "<no-name>"
+
+    def _get_children(node: Any) -> list[Any] | None:
+        # 通用兜底：通过 _iter_children 抽取（适配 pydantic/降级对象/自定义容器）
+        try:
+            child_v = None
+            cats_v = None
+            for k, v in _iter_children(node):
+                if k == "children":
+                    child_v = v
+                elif k == "categories":
+                    cats_v = v
+            if isinstance(child_v, list):
+                return child_v
+            if isinstance(cats_v, list):
+                return cats_v
+        except Exception:
+            pass
+
+        if isinstance(node, dict):
+            ch = node.get("children")
+            if isinstance(ch, list):
+                return ch
+            ch2 = node.get("categories")
+            return ch2 if isinstance(ch2, list) else None
+        st = getattr(node, "_state", None)
+        if isinstance(st, dict):
+            ch = st.get("children")
+            if isinstance(ch, list):
+                return ch
+            ch2 = st.get("categories")
+            return ch2 if isinstance(ch2, list) else None
+        ch = getattr(node, "children", None)
+        if isinstance(ch, list):
+            return ch
+        ch2 = getattr(node, "categories", None)
+        return ch2 if isinstance(ch2, list) else None
+
+    def walk(node: Any, depth: int) -> None:
+        nonlocal node_count, truncated
+        if truncated:
+            return
+        if depth > max_depth:
+            lines.append(("  " * depth) + "… (max depth reached)")
+            truncated = True
+            return
+        nid = id(node)
+        if nid in seen:
+            lines.append(("  " * depth) + "… (cycle)")
+            return
+        seen.add(nid)
+        node_count += 1
+        if node_count > max_nodes:
+            lines.append(("  " * depth) + f"… (truncated, >{max_nodes} nodes)")
+            truncated = True
+            return
+
+        lines.append(("  " * depth) + _get_name(node))
+
+        children = _get_children(node)
+        if not isinstance(children, list) or not children:
+            return
+        for ch in children:
+            # 子节点只要能提取出 name，就继续递归（即使它没有 children，也会作为叶子显示）
+            if _has_meaningful_name(ch):
+                walk(ch, depth + 1)
+            else:
+                lines.append(("  " * (depth + 1)) + f"<{_type_label(ch)}>")
+
+    walk(root, 0)
+    header = f"name subtree: nodes={min(node_count, max_nodes)}"
+    if truncated:
+        header += " (truncated)"
+    return header + "\n" + "\n".join(lines)
+
+
+def _build_recursive_preview_data(
+    value: Any,
+    *,
+    max_depth: int = _DETAIL_SUBTREE_MAX_DEPTH,
+    max_nodes: int = _DETAIL_SUBTREE_MAX_NODES,
+    allowed_fields: set[str] | None = None,
+) -> Any:
+    """将对象递归转换为可 JSON 序列化的预览结构。"""
+    seen: set[int] = set()
+    node_count = 0
+
+    def walk(obj: Any, depth: int) -> Any:
+        nonlocal node_count
+        if not _is_container(obj):
+            return obj
+        if depth >= max_depth:
+            return f"<max depth: {max_depth}>"
+
+        oid = id(obj)
+        if oid in seen:
+            return "<cycle>"
+        seen.add(oid)
+
+        node_count += 1
+        if node_count > max_nodes:
+            return f"<truncated: >{max_nodes} nodes>"
+
+        if isinstance(obj, (list, tuple)):
+            out_list: list[Any] = []
+            for _k, child in _iter_children(obj):
+                out_list.append(walk(child, depth + 1))
+            return out_list
+
+        out_dict: dict[str, Any] = {}
+        for k, child in _iter_children(obj):
+            key_s = str(k)
+            if allowed_fields is not None and key_s not in allowed_fields:
+                continue
+            out_dict[key_s] = walk(child, depth + 1)
+        return out_dict
+
+    return walk(value, 0)
+
+
+def _populate_detail_subtree_widget(
+    tree: QTreeWidget,
+    value: Any,
+    *,
+    max_depth: int = _DETAIL_SUBTREE_MAX_DEPTH,
+    max_nodes: int = _DETAIL_SUBTREE_MAX_NODES,
+    display_fields: list[str] | None = None,
+) -> None:
+    """将目录节点填充到右侧独立树控件。"""
+    tree.clear()
+    leaf_fields = [f for f in (display_fields or ["name", "id"]) if f not in ("children", "categories")]
+    if not leaf_fields:
+        leaf_fields = ["name", "id"]
+    if len(leaf_fields) == 1:
+        leaf_fields.append("id" if leaf_fields[0] != "id" else "")
+    tree.setHeaderLabels([leaf_fields[0], leaf_fields[1]])
+
+    if not _is_tree_node_like(value):
+        QTreeWidgetItem(tree, ["当前选择不是目录节点", ""])
+        tree.expandAll()
+        return
+
+    seen: set[int] = set()
+    node_count = 0
+    truncated = False
+
+    def walk(parent: QTreeWidget | QTreeWidgetItem, node: Any, depth: int) -> None:
+        nonlocal node_count, truncated
+        if truncated:
+            return
+        if depth > max_depth:
+            QTreeWidgetItem(parent, ["… (max depth reached)", ""])
+            truncated = True
+            return
+        nid = id(node)
+        if nid in seen:
+            QTreeWidgetItem(parent, ["… (cycle)", ""])
+            return
+        seen.add(nid)
+
+        node_count += 1
+        if node_count > max_nodes:
+            QTreeWidgetItem(parent, [f"… (truncated, >{max_nodes} nodes)", ""])
+            truncated = True
+            return
+
+        first = _object_field_value(node, leaf_fields[0])
+        second = _object_field_value(node, leaf_fields[1]) if leaf_fields[1] else ""
+        item = QTreeWidgetItem(
+            parent,
+            [
+                str(first).strip() if first not in (None, "") else "<no-value>",
+                str(second).strip() if second not in (None, "") else "",
+            ],
+        )
+        children = _tree_node_children(node)
+        if not isinstance(children, list) or not children:
+            return
+        for child in children:
+            child_name = _tree_node_name(child)
+            if child_name is not None:
+                walk(item, child, depth + 1)
+            else:
+                QTreeWidgetItem(item, [f"<{_type_label(child)}>", ""])
+
+    walk(tree, value, 0)
+    tree.expandToDepth(min(max_depth, 2))
 
 
 class GenericPickleObject:
@@ -282,6 +868,13 @@ def _node_label(value: Any) -> str:
     if isinstance(value, (list, tuple)):
         t = "list" if isinstance(value, list) else "tuple"
         return f"{t}  ({len(value)})"
+    # 常见业务对象（如 MuseCategoryTreeNodeModel）优先展示 name，便于树浏览
+    try:
+        nm = getattr(value, "name", None)
+        if isinstance(nm, str) and nm.strip():
+            return nm.strip()
+    except Exception:
+        pass
     # Missing-type fallback objects: keep value column compact and readable.
     if isinstance(value, GenericPickleObject):
         return _type_label(value)
@@ -685,7 +1278,12 @@ class _HistoryRow(QWidget):
 class PklViewer(QMainWindow):
     def __init__(self, initial_file: str | None = None) -> None:
         super().__init__()
-        self.setWindowTitle("PKL Viewer")
+        try:
+            src = Path(__file__).resolve()
+            stamp = datetime.datetime.fromtimestamp(src.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            self.setWindowTitle(f"PKL Viewer  |  {src.name}  |  {stamp}")
+        except Exception:
+            self.setWindowTitle("PKL Viewer")
         self.resize(1300, 700)
         self._current_obj: Any = None
         self._load_thread: _LoadThread | None = None
@@ -707,11 +1305,20 @@ class PklViewer(QMainWindow):
         self._search_combo_user_picked: bool = False
         self._deep_search_running: bool = False
         self._search_first_nav_pending: bool = False
+        self._detail_presets: list[dict[str, Any]] = self._load_detail_presets()
         self._rebuild_combo_timer = QTimer(self)
         self._rebuild_combo_timer.setSingleShot(True)
         self._rebuild_combo_timer.setInterval(200)
         self._rebuild_combo_timer.timeout.connect(self._on_rebuild_combo_timeout)
         self._load_ui()
+        # 在状态栏也标识当前运行脚本，避免误启动到旧版本
+        try:
+            src = Path(__file__).resolve()
+            stamp = datetime.datetime.fromtimestamp(src.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            if hasattr(self, "_status") and isinstance(self._status, QStatusBar):
+                self._status.showMessage(f"脚本: {src}  |  mtime: {stamp}", 6000)
+        except Exception:
+            pass
         self._refresh_history_list()
         if initial_file and Path(initial_file).exists():
             self._load_file(initial_file)
@@ -775,10 +1382,10 @@ class PklViewer(QMainWindow):
         _apply_ui_layout_after_load(central)
 
         self._path_label = _require_ui_child(central, QLabel, "pathLabel")
-        _require_ui_child(central, QPushButton, "openButton").clicked.connect(self._on_open)
-        _require_ui_child(central, QPushButton, "reloadButton").clicked.connect(
-            self._on_reload
-        )
+        open_btn = _require_ui_child(central, QPushButton, "openButton")
+        open_btn.clicked.connect(self._on_open)
+        reload_btn = _require_ui_child(central, QPushButton, "reloadButton")
+        reload_btn.clicked.connect(self._on_reload)
         _require_ui_child(central, QPushButton, "refreshMetaButton").clicked.connect(
             self._on_refresh_log_and_file_meta
         )
@@ -786,9 +1393,30 @@ class PklViewer(QMainWindow):
             self._on_history_remove
         )
 
+        # 顶栏增加“重启程序”按钮（不修改 .ui，运行时插入到 toolbar 布局）
+        try:
+            toolbar_lay = central.findChild(QHBoxLayout, "horizontalLayout_toolbar")
+            if isinstance(toolbar_lay, QHBoxLayout):
+                restart_btn = QPushButton("重启程序", central)
+                restart_btn.setToolTip("重新拉起当前程序并退出（用于热更新 UI/代码）")
+                restart_btn.clicked.connect(self._on_restart_app)
+                # 尽量插在 reload 后面
+                try:
+                    idx = toolbar_lay.indexOf(reload_btn)
+                    toolbar_lay.insertWidget(idx + 1, restart_btn)
+                except Exception:
+                    toolbar_lay.addWidget(restart_btn)
+        except Exception:
+            traceback.print_exc()
+            _log_exception("插入重启按钮失败")
+
         self._main_tabs = _require_ui_child(central, QTabWidget, "mainTabs")
         self._tree = _require_ui_child(central, QTreeWidget, "treeWidget")
         self._detail = _require_ui_child(central, QTextEdit, "detailText")
+        self._detail_splitter: QSplitter | None = None
+        self._detail_preset_combo: QComboBox | None = None
+        self._detail_tree: QTreeWidget | None = None
+        self._subtree_level_combo: QComboBox | None = None
         self._history_scroll = _require_ui_child(central, QScrollArea, "historyScroll")
         self._history_inner = _require_ui_child(central, QWidget, "historyInner")
         inner_layout = self._history_inner.layout()
@@ -832,11 +1460,220 @@ class PklViewer(QMainWindow):
         self._detail.setFont(QFont("Consolas", 12))
         self._log_view.setFont(QFont("Consolas", 10))
 
+        # 右侧详情：detailText 在 .ui 中是 QSplitter 的直接子控件，包一层容器后放入“文本预览 + 独立目录树”
+        try:
+            splitter = self._detail.parentWidget()
+            if isinstance(splitter, QSplitter):
+                idx = splitter.indexOf(self._detail)
+                self._detail.setParent(None)
+
+                detail_wrap = QWidget(splitter)
+                detail_wrap.setObjectName("detailWrap")
+                wrap_lay = QVBoxLayout(detail_wrap)
+                wrap_lay.setContentsMargins(0, 0, 0, 0)
+                wrap_lay.setSpacing(4)
+
+                bar = QWidget(detail_wrap)
+                bar_lay = QHBoxLayout(bar)
+                bar_lay.setContentsMargins(0, 0, 0, 0)
+                bar_lay.setSpacing(8)
+                bar_lay.addWidget(QLabel("完整预设：", bar))
+                detail_preset_combo = QComboBox(bar)
+                detail_preset_combo.currentIndexChanged.connect(
+                    lambda _idx: self._refresh_detail_from_current_item()
+                )
+                bar_lay.addWidget(detail_preset_combo, 1)
+
+                edit_preset_btn = QPushButton("编辑预设...", bar)
+                edit_preset_btn.clicked.connect(self._on_edit_detail_preset)
+                bar_lay.addWidget(edit_preset_btn)
+
+                bar_lay.addWidget(QLabel("子树展开：", bar))
+                level_combo = QComboBox(bar)
+                level_combo.setEditable(True)
+                level_combo.setToolTip("只控制展开到第几级，例如 3 / 5 / 12")
+                for level in _DETAIL_SUBTREE_LEVEL_PRESETS:
+                    level_combo.addItem(level)
+                level_combo.setCurrentText("12")
+                level_combo.currentIndexChanged.connect(
+                    lambda _idx: self._refresh_detail_from_current_item()
+                )
+                level_combo.editTextChanged.connect(
+                    lambda _text: self._refresh_detail_from_current_item()
+                )
+                bar_lay.addWidget(level_combo)
+                bar_lay.addStretch(1)
+
+                wrap_lay.addWidget(bar)
+                detail_splitter = QSplitter(Qt.Orientation.Vertical, detail_wrap)
+                detail_splitter.setChildrenCollapsible(False)
+                detail_splitter.addWidget(self._detail)
+
+                detail_tree = QTreeWidget(detail_splitter)
+                detail_tree.setObjectName("detailTreeWidget")
+                detail_tree.setAlternatingRowColors(True)
+                detail_tree.setUniformRowHeights(True)
+                detail_tree.setStyleSheet(
+                    "QTreeWidget { background: #1e1e1e; color: #d4d4d4; border: none; font-size: 13px; } "
+                    "QTreeWidget::item:selected { background: #264f78; } "
+                    "QHeaderView::section { background: #2d2d2d; color: #ccc; padding: 4px; border: none; }"
+                )
+                detail_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+                detail_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+                detail_tree.setHeaderLabels(["name", "id"])
+                detail_splitter.addWidget(detail_tree)
+                detail_splitter.setSizes([340, 260])
+
+                wrap_lay.addWidget(detail_splitter, 1)
+                splitter.insertWidget(idx, detail_wrap)
+                self._detail_splitter = detail_splitter
+                self._detail_preset_combo = detail_preset_combo
+                self._detail_tree = detail_tree
+                self._subtree_level_combo = level_combo
+                self._refresh_detail_preset_combo()
+        except Exception:
+            traceback.print_exc()
+            _log_exception("插入子树展开下拉框失败")
+
         self._reload_app_log_view()
 
         self._status = QStatusBar()
         self.setStatusBar(self._status)
         self.setStyleSheet("QMainWindow { background: #252526; }")
+
+    def _load_detail_presets(self) -> list[dict[str, Any]]:
+        try:
+            if _DETAIL_PRESET_FILE.is_file():
+                data = json.loads(_DETAIL_PRESET_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    presets = [_normalize_detail_preset(item) for item in data]
+                    if presets:
+                        return presets
+        except Exception:
+            traceback.print_exc()
+            _log_exception("读取完整预设失败")
+        return _clone_default_detail_presets()
+
+    def _save_detail_presets(self) -> None:
+        try:
+            _DETAIL_PRESET_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _DETAIL_PRESET_FILE.write_text(
+                json.dumps(self._detail_presets, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            traceback.print_exc()
+            _log_exception("保存完整预设失败")
+
+    def _refresh_detail_preset_combo(self, selected_name: str | None = None) -> None:
+        combo = getattr(self, "_detail_preset_combo", None)
+        if not isinstance(combo, QComboBox):
+            return
+        current_name = selected_name or combo.currentText()
+        combo.blockSignals(True)
+        combo.clear()
+        target_idx = 0
+        for idx, preset in enumerate(self._detail_presets):
+            name = str(preset.get("name") or f"预设{idx+1}")
+            combo.addItem(name)
+            if name == current_name:
+                target_idx = idx
+        combo.setCurrentIndex(target_idx)
+        combo.blockSignals(False)
+
+    def _current_detail_preset(self) -> dict[str, Any]:
+        combo = getattr(self, "_detail_preset_combo", None)
+        idx = combo.currentIndex() if isinstance(combo, QComboBox) else -1
+        if 0 <= idx < len(self._detail_presets):
+            return _normalize_detail_preset(self._detail_presets[idx])
+        if self._detail_presets:
+            return _normalize_detail_preset(self._detail_presets[0])
+        return _normalize_detail_preset(_DEFAULT_DETAIL_PRESETS[0])
+
+    def _current_subtree_level(self) -> int:
+        combo = getattr(self, "_subtree_level_combo", None)
+        raw = combo.currentText().strip() if isinstance(combo, QComboBox) else ""
+        try:
+            return max(1, min(50, int(raw)))
+        except ValueError:
+            return 12
+
+    def _on_edit_detail_preset(self) -> None:
+        current = self._current_detail_preset()
+        dlg = _DetailPresetEditorDialog(self, current)
+        if dlg.exec() != int(QDialog.DialogCode.Accepted):
+            return
+        combo = getattr(self, "_detail_preset_combo", None)
+        idx = combo.currentIndex() if isinstance(combo, QComboBox) else 0
+        if dlg.delete_requested:
+            if len(self._detail_presets) <= 1:
+                self._status.showMessage("至少保留一个完整预设", 3000)
+                return
+            if 0 <= idx < len(self._detail_presets):
+                self._detail_presets.pop(idx)
+                self._save_detail_presets()
+                self._refresh_detail_preset_combo()
+                self._refresh_detail_from_current_item()
+            return
+
+        updated = dlg.build_preset()
+        if 0 <= idx < len(self._detail_presets):
+            self._detail_presets[idx] = updated
+        else:
+            self._detail_presets.append(updated)
+        self._save_detail_presets()
+        self._refresh_detail_preset_combo(str(updated.get("name") or ""))
+        self._refresh_detail_from_current_item()
+
+    def _refresh_detail_from_current_item(self) -> None:
+        """下拉框变化时，重绘当前选中项的右侧详情。"""
+        try:
+            it = self._tree.currentItem()
+            if it is None:
+                return
+            self._on_item_selected(it, None)
+        except Exception:
+            traceback.print_exc()
+            _log_exception("刷新详情失败")
+
+    def _apply_detail_preview_visibility(self, *, show_text: bool, show_tree: bool) -> None:
+        self._detail.setVisible(bool(show_text))
+        tree = self._detail_tree
+        if isinstance(tree, QTreeWidget):
+            tree.setVisible(bool(show_tree))
+        splitter = self._detail_splitter
+        if isinstance(splitter, QSplitter):
+            if show_text and show_tree:
+                splitter.setSizes([340, 260])
+            elif show_text:
+                splitter.setSizes([1, 0])
+            elif show_tree:
+                splitter.setSizes([0, 1])
+
+    def _set_detail_tree_message(self, text: str) -> None:
+        tree = self._detail_tree
+        if not isinstance(tree, QTreeWidget):
+            return
+        preset = self._current_detail_preset()
+        fields = preset.get("tree_columns")
+        leaf_fields = [f for f in (fields or ["name", "id"]) if f not in ("children", "categories")]
+        if not leaf_fields:
+            leaf_fields = ["name", "id"]
+        if len(leaf_fields) == 1:
+            leaf_fields.append("id" if leaf_fields[0] != "id" else "")
+        tree.clear()
+        tree.setHeaderLabels([leaf_fields[0], leaf_fields[1]])
+        QTreeWidgetItem(tree, [text, ""])
+        tree.expandAll()
+
+    def _build_shallow_preview_text(self, value: Any, allowed_fields: set[str] | None = None) -> str:
+        shallow: dict = {}
+        for k, v in _iter_children(value):
+            key_s = str(k)
+            if allowed_fields is not None and key_s not in allowed_fields:
+                continue
+            shallow[key_s] = {"value": _node_label(v), "type": _type_label(v)}
+        return json.dumps(shallow, ensure_ascii=False, indent=2, default=str)
 
     def _stop_keys_thread(self) -> None:
         t = self._keys_thread
@@ -1257,6 +2094,24 @@ class PklViewer(QMainWindow):
         if path:
             self._load_file(path)
 
+    def _on_restart_app(self) -> None:
+        """重启当前程序进程。"""
+        try:
+            args = list(sys.argv)
+            # 没带参数时，尽量把当前已打开的文件带上（方便“重启后继续看同一份 pkl”）
+            if len(args) <= 1:
+                tip = self._path_label.toolTip()
+                if tip and Path(tip).exists():
+                    args.append(tip)
+            cmd = [sys.executable] + args
+            subprocess.Popen(cmd, close_fds=True)
+        except Exception as e:
+            traceback.print_exc()
+            _log_exception("重启失败")
+            self._status.showMessage(f"重启失败: {e}", 4500)
+            return
+        QApplication.quit()
+
     def _load_file(self, path: str) -> None:
         if self._load_thread and self._load_thread.isRunning():
             self._load_thread.quit()
@@ -1274,6 +2129,7 @@ class PklViewer(QMainWindow):
         self._status.showMessage(f"加载中: {Path(path).name} .", 0)
         self._tree.clear()
         self._detail.clear()
+        self._set_detail_tree_message("等待选择节点")
 
         thread = _LoadThread(path)
         thread.done.connect(lambda obj, t, fallback: self._on_loaded(obj, t, path, fallback))
@@ -1337,25 +2193,66 @@ class PklViewer(QMainWindow):
     def _on_item_selected(self, current: QTreeWidgetItem | None, _prev: QTreeWidgetItem | None) -> None:
         if current is None:
             return
+        cfg = self._current_detail_preset()
+        field_list = cfg.get("fields")
+        allowed_fields = None if field_list is None else set(field_list)
+        max_depth = self._current_subtree_level()
+        max_nodes = 20_000
+        self._apply_detail_preview_visibility(
+            show_text=bool(cfg.get("show_text", True)),
+            show_tree=bool(cfg.get("show_tree", True)),
+        )
         value = current.data(0, Qt.ItemDataRole.UserRole)
         if value is None or value == _PLACEHOLDER:
-            self._detail.setPlainText(current.text(1))
+            if bool(cfg.get("show_text", True)):
+                self._detail.setPlainText(current.text(1))
+            self._set_detail_tree_message("当前选择不是目录节点")
             return
         if isinstance(value, tuple) and len(value) == 3 and value[0] == "__more__":
-            self._detail.setPlainText("(more items placeholder)")
+            if bool(cfg.get("show_text", True)):
+                self._detail.setPlainText("(more items placeholder)")
+            self._set_detail_tree_message("占位节点不支持目录树预览")
             return
         try:
-            shallow: dict = {}
-            for k, v in _iter_children(value):
-                shallow[k] = {"value": _node_label(v), "type": _type_label(v)}
-            text = json.dumps(shallow, ensure_ascii=False, indent=2, default=str)
-            if len(text) > _DETAIL_MAX_CHARS:
-                text = text[:_DETAIL_MAX_CHARS] + f"\n\n... (truncated, total {len(text)} chars)"
-            self._detail.setPlainText(text)
+            # 目录节点使用真正的递归 JSON 预览，直接展开 children/categories
+            if _is_tree_node_like(value):
+                if bool(cfg.get("show_text", True)):
+                    if cfg.get("text_mode") == "shallow":
+                        text = self._build_shallow_preview_text(value, allowed_fields=allowed_fields)
+                    else:
+                        preview = _build_recursive_preview_data(
+                            value,
+                            max_depth=max_depth,
+                            max_nodes=max_nodes,
+                            allowed_fields=allowed_fields,
+                        )
+                        text = json.dumps(preview, ensure_ascii=False, indent=2, default=str)
+                    if len(text) > _DETAIL_MAX_CHARS:
+                        text = text[:_DETAIL_MAX_CHARS] + f"\n\n... (truncated, total {len(text)} chars)"
+                    self._detail.setPlainText(text)
+                tree = self._detail_tree
+                if bool(cfg.get("show_tree", True)) and isinstance(tree, QTreeWidget):
+                    _populate_detail_subtree_widget(
+                        tree,
+                        value,
+                        max_depth=max_depth,
+                        max_nodes=max_nodes,
+                        display_fields=cfg.get("tree_columns"),
+                    )
+                return
+
+            if bool(cfg.get("show_text", True)):
+                text = self._build_shallow_preview_text(value, allowed_fields=allowed_fields)
+                if len(text) > _DETAIL_MAX_CHARS:
+                    text = text[:_DETAIL_MAX_CHARS] + f"\n\n... (truncated, total {len(text)} chars)"
+                self._detail.setPlainText(text)
+            self._set_detail_tree_message("当前选择不是目录节点")
         except Exception as e:
             traceback.print_exc()
             _log_exception("序列化详情视图失败")
-            self._detail.setPlainText(f"序列化失败: {e}\n\n{current.text(1)}")
+            if bool(cfg.get("show_text", True)):
+                self._detail.setPlainText(f"序列化失败: {e}\n\n{current.text(1)}")
+            self._set_detail_tree_message("目录树预览失败")
 
 
 def _resolve_icon(app: "QApplication") -> QIcon:
