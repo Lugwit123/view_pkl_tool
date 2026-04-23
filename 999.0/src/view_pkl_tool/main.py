@@ -1196,6 +1196,15 @@ class _HistoryRow(QWidget):
         self._meta_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         layout.addWidget(self._meta_label, 0)
 
+        # 完整路径（9px 小字）
+        self._path_row_label = QLabel(path)
+        self._path_row_label.setStyleSheet(
+            "color: #666; font-size: 9px; padding: 0px 2px 2px 2px; background: transparent;"
+        )
+        self._path_row_label.setWordWrap(True)
+        self._path_row_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        layout.addWidget(self._path_row_label, 0)
+
         self.setToolTip(path)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         QTimer.singleShot(0, self._sync_text_height)
@@ -1211,6 +1220,14 @@ class _HistoryRow(QWidget):
         doc_h = math.ceil(self._text.document().size().height())
         # 文档高度常含额外行距，略压一点避免 item 之间空白过大
         self._text.setFixedHeight(max(doc_h + 2, 20))
+
+    def enterEvent(self, event) -> None:  # type: ignore[override]
+        super().enterEvent(event)
+        self._viewer._status.showMessage(self._path, 0)
+
+    def leaveEvent(self, event) -> None:  # type: ignore[override]
+        super().leaveEvent(event)
+        self._viewer._restore_status_path()
 
     def resizeEvent(self, event) -> None:  # type: ignore[override]
         super().resizeEvent(event)
@@ -1243,13 +1260,22 @@ class _HistoryRow(QWidget):
             self._meta_label.setStyleSheet(
                 "color: #555; font-size: 10px; padding: 0px 2px 1px 2px; background: transparent;"
             )
+            self._path_row_label.setStyleSheet(
+                "color: #444; font-size: 9px; padding: 0px 2px 2px 2px; background: transparent;"
+            )
         elif selected:
             self._meta_label.setStyleSheet(
                 "color: #aaa; font-size: 10px; padding: 0px 2px 1px 2px; background: transparent;"
             )
+            self._path_row_label.setStyleSheet(
+                "color: #888; font-size: 9px; padding: 0px 2px 2px 2px; background: transparent;"
+            )
         else:
             self._meta_label.setStyleSheet(
                 "color: #888; font-size: 10px; padding: 0px 2px 1px 2px; background: transparent;"
+            )
+            self._path_row_label.setStyleSheet(
+                "color: #666; font-size: 9px; padding: 0px 2px 2px 2px; background: transparent;"
             )
 
     def sync_font_from_list_container(self) -> None:
@@ -1967,6 +1993,14 @@ class PklViewer(QMainWindow):
         self._refresh_history_rows_meta()
         self._status.showMessage("已刷新运行日志与「最近打开」中的文件大小、修改时间", 3000)
 
+    def _restore_status_path(self) -> None:
+        """恢复状态栏显示当前打开文件的完整路径；未加载时清空。"""
+        cur = self._path_label.toolTip() if hasattr(self, "_path_label") else ""
+        if cur:
+            self._status.showMessage(cur, 0)
+        else:
+            self._status.clearMessage()
+
     def _refresh_history_list(self) -> None:
         self._history_selected_row = None
         layout = self._history_layout
@@ -1978,10 +2012,14 @@ class PklViewer(QMainWindow):
             if w is not None:
                 w.deleteLater()
             del li
+        cur_path = self._path_label.toolTip() if hasattr(self, "_path_label") else ""
         for path in self._history.all():
             row = _HistoryRow(path, self)
             missing = not Path(path).exists()
-            row.apply_style(selected=False, missing=missing)
+            is_current = bool(cur_path) and Path(path) == Path(cur_path)
+            row.apply_style(selected=is_current, missing=missing)
+            if is_current:
+                self._history_selected_row = row
             layout.addWidget(row)
             row.sync_font_from_list_container()
         layout.addStretch(1)
@@ -2158,7 +2196,8 @@ class PklViewer(QMainWindow):
         QApplication.processEvents()
         self._refresh_tree(obj)
         suffix = " | 已使用兼容模式(缺失类已降级)" if used_fallback else ""
-        self._status.showMessage(f"已加载: {path}  |  类型: {type_name}{suffix}", 0)
+        self._status.showMessage(f"{path}  |  类型: {type_name}{suffix}", 0)
+        self._refresh_history_list()
 
     def _refresh_tree(self, obj: Any) -> None:
         self._stop_deep_search_thread()
