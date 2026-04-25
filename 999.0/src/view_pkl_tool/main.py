@@ -13,6 +13,7 @@ import pickle
 import subprocess
 import sys
 import traceback
+import types
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -41,6 +42,8 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMenu,
+    QMessageBox,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -48,6 +51,7 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QTabWidget,
     QTextEdit,
+    QToolButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -101,11 +105,14 @@ def _apply_ui_layout_after_load(central: QWidget) -> None:
         sp.setSizes([220, 680, 360])
 
 
-_MAX_CHILDREN = 200
+# 单次展开/分页展示的子项数量。数值越大，展开越可能卡 UI。
+_MAX_CHILDREN = 60
+_BATCH_ADD_CHILDREN = 25
 _DETAIL_MAX_CHARS = 50_000
 _PLACEHOLDER = "__placeholder__"
 _HISTORY_FILE = Path(r"D:\Temp\pkl") / "pkl_viewer_history.json"
 _DETAIL_PRESET_FILE = Path(r"D:\Temp\pkl") / "pkl_viewer_detail_presets.json"
+_SEARCH_FIELD_PRESET_FILE = Path(r"D:\Temp\pkl") / "pkl_viewer_search_fields.json"
 _HISTORY_MAX = 20
 _LOG_FILE = Path(r"D:\Temp\pkl") / "pkl_viewer.log"
 
@@ -114,6 +121,7 @@ _LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 # 树搜索：下拉「字段名」= 键列去重；后台线程遍历整棵对象图（含未展开节点），匹配后定位到树节点。
 _SEARCH_ALL_FIELDS = "【全部字段】"
 _SEARCH_DEFAULT_FIELD = "name"
+_SEARCH_FIXED_FIELDS: list[str] = ["name", "path", _SEARCH_ALL_FIELDS]
 _DEEP_SEARCH_BATCH = 256
 _DEEP_SEARCH_YIELD_NODES = 6000
 _KEYS_COLLECT_YIELD_NODES = 8000
@@ -200,6 +208,26 @@ def _normalize_field_list(text: str) -> list[str] | None:
 
 def _field_list_to_text(fields: list[str] | None) -> str:
     return "*" if fields is None else ",".join(fields)
+
+
+def _normalize_search_field_list(raw: Any) -> list[str]:
+    if isinstance(raw, str):
+        text = raw
+    elif isinstance(raw, list):
+        text = ",".join(str(x) for x in raw if str(x).strip())
+    else:
+        text = ""
+    fields = _normalize_field_list(text) or []
+    result: list[str] = []
+    seen: set[str] = set()
+    for field in fields:
+        name = str(field).strip()
+        if not name or name == _SEARCH_ALL_FIELDS:
+            continue
+        if name not in seen:
+            result.append(name)
+            seen.add(name)
+    return result
 
 
 def _normalize_detail_preset(raw: Any) -> dict[str, Any]:
@@ -296,6 +324,40 @@ class _DetailPresetEditorDialog(QDialog):
                 "tree_columns": _normalize_field_list(self.tree_columns_edit.text()),
             }
         )
+
+
+class _SearchFieldSettingsDialog(QDialog):
+    def __init__(self, parent: QWidget, custom_fields: list[str]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("字段名设置")
+        self.resize(520, 360)
+
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            "字段名下拉框会始终固定保留：name、path、【全部字段】。\n"
+            "下面只配置额外的自定义项；支持逗号 / 空格 / 换行分隔。"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        fixed_label = QLabel("固定项：name, path, 【全部字段】")
+        fixed_label.setStyleSheet("color: #aaa;")
+        layout.addWidget(fixed_label)
+
+        self.fields_edit = QTextEdit()
+        self.fields_edit.setPlaceholderText("例如: id,parent_id,name_multil")
+        self.fields_edit.setPlainText("\n".join(custom_fields))
+        layout.addWidget(self.fields_edit, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def build_fields(self) -> list[str]:
+        return _normalize_search_field_list(self.fields_edit.toPlainText())
 
 
 def _pick_name_from_multil(m: Any) -> str | None:
@@ -733,6 +795,30 @@ class TolerantUnpickler(pickle.Unpickler):
         raw = f"Missing_{module}_{name}"
         return "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in raw)
 
+    @staticmethod
+    def _ensure_missing_types_module() -> types.ModuleType:
+        """
+        让缺失类型占位类可被 pickle 保存。
+
+        pickle 保存 class 时要求：class.__module__ 可 import，且模块内有同名符号。
+        由于本工具常以脚本形式运行（无 package），这里在运行时注册一个模块到 sys.modules。
+        """
+        pkg_name = "view_pkl_tool"
+        mod_name = "view_pkl_tool.missing_types"
+
+        pkg = sys.modules.get(pkg_name)
+        if pkg is None:
+            pkg = types.ModuleType(pkg_name)
+            pkg.__path__ = []  # 标记为 package-like
+            sys.modules[pkg_name] = pkg
+
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            mod = types.ModuleType(mod_name)
+            sys.modules[mod_name] = mod
+            setattr(pkg, "missing_types", mod)
+        return mod
+
     def find_class(self, module, name):
         try:
             return super().find_class(module, name)
@@ -742,6 +828,7 @@ class TolerantUnpickler(pickle.Unpickler):
             if cached is not None:
                 return cached
 
+            missing_mod = self._ensure_missing_types_module()
             missing_type = type(
                 self._safe_type_name(module, name),
                 (GenericPickleObject,),
@@ -751,6 +838,8 @@ class TolerantUnpickler(pickle.Unpickler):
                     "__module__": "view_pkl_tool.missing_types",
                 },
             )
+            # 确保该类型在模块命名空间下可 import（pickle 保存需要）
+            setattr(missing_mod, missing_type.__name__, missing_type)
             self._missing_class_cache[key] = missing_type
             return missing_type
 
@@ -851,39 +940,82 @@ class _LoadThread(QThread):
             self.error.emit(str(e))
 
 
+_TYPE_LABEL_CACHE: dict[int, str] = {}
+_NODE_LABEL_CACHE: dict[int, str] = {}
+
+
 def _type_label(value: Any) -> str:
     if value is None:
         return "NoneType"
+    # 基础类型没必要缓存
+    if isinstance(value, (str, int, float, bool, bytes, bytearray)):
+        return type(value).__name__
+    vid = id(value)
+    cached = _TYPE_LABEL_CACHE.get(vid)
+    if cached is not None:
+        return cached
     # For placeholder objects created during tolerant unpickling, only show
     # struct/class name to keep the type column compact.
     if isinstance(value, GenericPickleObject):
         class_name = getattr(value.__class__, "__missing_class__", type(value).__name__)
+        _TYPE_LABEL_CACHE[vid] = class_name
         return class_name
-    return type(value).__name__
+    t = type(value).__name__
+    _TYPE_LABEL_CACHE[vid] = t
+    return t
 
 
 def _node_label(value: Any) -> str:
+    # 基础类型直接显示
+    if value is None:
+        return "None"
+    if isinstance(value, (str, int, float, bool)):
+        s = str(value)
+        return s[:120] + "..." if len(s) > 120 else s
+    if isinstance(value, (bytes, bytearray)):
+        return f"bytes  ({len(value)})"
+
+    vid = id(value)
+    cached = _NODE_LABEL_CACHE.get(vid)
+    if cached is not None:
+        return cached
+
     if isinstance(value, dict):
-        return f"dict  ({len(value)})"
+        out = f"dict  ({len(value)})"
+        _NODE_LABEL_CACHE[vid] = out
+        return out
     if isinstance(value, (list, tuple)):
         t = "list" if isinstance(value, list) else "tuple"
-        return f"{t}  ({len(value)})"
+        out = f"{t}  ({len(value)})"
+        _NODE_LABEL_CACHE[vid] = out
+        return out
     # 常见业务对象（如 MuseCategoryTreeNodeModel）优先展示 name，便于树浏览
     try:
         nm = getattr(value, "name", None)
         if isinstance(nm, str) and nm.strip():
-            return nm.strip()
+            out = nm.strip()
+            _NODE_LABEL_CACHE[vid] = out
+            return out
     except Exception:
         pass
     # Missing-type fallback objects: keep value column compact and readable.
     if isinstance(value, GenericPickleObject):
-        return _type_label(value)
+        out = _type_label(value)
+        _NODE_LABEL_CACHE[vid] = out
+        return out
     if hasattr(value, "__fields__"):
-        return f"{type(value).__name__}  ({len(value.__fields__)} fields)"
+        out = f"{type(value).__name__}  ({len(value.__fields__)} fields)"
+        _NODE_LABEL_CACHE[vid] = out
+        return out
     if hasattr(value, "__dict__") and not isinstance(value, type):
-        return f"{type(value).__name__}  ({len(vars(value))} attrs)"
-    s = str(value)
-    return s[:120] + "..." if len(s) > 120 else s
+        out = f"{type(value).__name__}  ({len(vars(value))} attrs)"
+        _NODE_LABEL_CACHE[vid] = out
+        return out
+
+    # 避免对未知对象调用 str()（可能非常慢/包含大量递归信息）
+    out = f"<{type(value).__name__}>"
+    _NODE_LABEL_CACHE[vid] = out
+    return out
 
 
 def _is_container(value: Any) -> bool:
@@ -911,6 +1043,204 @@ def _iter_children(value: Any):
         yield from ((k, v) for k, v in vars(value).items())
 
 
+def _replace_strings_in_object(
+    root: Any,
+    *,
+    fields: set[str] | None,
+    needle: str,
+    replacement: str,
+) -> tuple[Any, int, int]:
+    """递归替换对象图中的字符串值；支持限制到指定字段名。"""
+    if not needle:
+        return root, 0, 0
+
+    values_changed = 0
+    total_replacements = 0
+    memo: dict[int, Any] = {}
+    active: set[int] = set()
+
+    def replace_text(text: str) -> str:
+        nonlocal values_changed, total_replacements
+        hit_count = text.count(needle)
+        if hit_count <= 0:
+            return text
+        values_changed += 1
+        total_replacements += hit_count
+        return text.replace(needle, replacement)
+
+    def visit_child(key: str, child: Any, *, force_replace: bool) -> Any:
+        if isinstance(child, str):
+            if not force_replace and fields is not None and key not in fields:
+                return child
+            return replace_text(child)
+        child_force = force_replace or fields is None or (key in fields)
+        return walk(child, force_replace=child_force)
+
+    def rebuild_tuple(value: tuple[Any, ...], *, force_replace: bool) -> tuple[Any, ...]:
+        items = [
+            visit_child(f"[{idx}]", child, force_replace=force_replace)
+            for idx, child in enumerate(value)
+        ]
+        if type(value) is tuple:
+            return tuple(items)
+        try:
+            return type(value)(*items)
+        except Exception:
+            return tuple(items)
+
+    def walk(value: Any, *, force_replace: bool = False) -> Any:
+        if isinstance(value, str):
+            if force_replace or fields is None:
+                return replace_text(value)
+            return value
+        if value is None or isinstance(
+            value, (int, float, bool, complex, bytes, bytearray)
+        ):
+            return value
+
+        vid = id(value)
+        if vid in memo:
+            return memo[vid]
+        if vid in active:
+            return value
+
+        active.add(vid)
+        try:
+            if isinstance(value, dict):
+                memo[vid] = value
+                for key, child in list(value.items()):
+                    new_child = visit_child(
+                        str(key), child, force_replace=force_replace
+                    )
+                    if new_child is not child:
+                        value[key] = new_child
+                return value
+
+            if isinstance(value, list):
+                memo[vid] = value
+                for idx, child in enumerate(value):
+                    new_child = visit_child(
+                        f"[{idx}]", child, force_replace=force_replace
+                    )
+                    if new_child is not child:
+                        value[idx] = new_child
+                return value
+
+            if isinstance(value, tuple):
+                new_value = rebuild_tuple(value, force_replace=force_replace)
+                memo[vid] = new_value
+                return new_value
+
+            if isinstance(value, set):
+                memo[vid] = value
+                new_items: list[Any] = []
+                changed = False
+                for child in value:
+                    new_child = walk(child, force_replace=force_replace)
+                    if new_child is not child:
+                        changed = True
+                    new_items.append(new_child)
+                if changed:
+                    value.clear()
+                    value.update(new_items)
+                return value
+
+            if isinstance(value, frozenset):
+                new_value = frozenset(
+                    walk(child, force_replace=force_replace) for child in value
+                )
+                memo[vid] = new_value
+                return new_value
+
+            if hasattr(value, "__fields__"):
+                memo[vid] = value
+                for field_name in value.__fields__:
+                    child = getattr(value, field_name, None)
+                    new_child = visit_child(
+                        str(field_name), child, force_replace=force_replace
+                    )
+                    if new_child is not child:
+                        setattr(value, field_name, new_child)
+                return value
+
+            if hasattr(value, "__dict__") and not isinstance(value, type):
+                memo[vid] = value
+                for attr_name, child in list(vars(value).items()):
+                    new_child = visit_child(
+                        str(attr_name), child, force_replace=force_replace
+                    )
+                    if new_child is not child:
+                        setattr(value, attr_name, new_child)
+                return value
+
+            return value
+        finally:
+            active.discard(vid)
+
+    return walk(root, force_replace=(fields is None)), values_changed, total_replacements
+
+
+def _make_portable_pickle_data(root: Any) -> Any:
+    """
+    将对象图转换成可移植的 pickle 数据（只包含内置基础类型），避免依赖业务类/本工具模块。
+
+    - GenericPickleObject -> dict（保留缺失类信息与 _state）
+    - 其它对象：尽量转 dict(vars)；失败则转 repr
+    - 循环引用：打断为 "<cycle>"
+    """
+
+    seen: set[int] = set()
+
+    def walk(v: Any) -> Any:
+        if v is None or isinstance(v, (str, int, float, bool)):
+            return v
+        if isinstance(v, (bytes, bytearray)):
+            return bytes(v)
+
+        vid = id(v)
+        if vid in seen:
+            return "<cycle>"
+        seen.add(vid)
+
+        if isinstance(v, dict):
+            return {str(k): walk(vv) for k, vv in v.items()}
+        if isinstance(v, list):
+            return [walk(x) for x in v]
+        if isinstance(v, tuple):
+            return [walk(x) for x in v]
+        if isinstance(v, set):
+            return [walk(x) for x in v]
+        if isinstance(v, frozenset):
+            return [walk(x) for x in v]
+
+        if isinstance(v, GenericPickleObject):
+            module_name = getattr(v.__class__, "__missing_module__", "unknown_module")
+            class_name = getattr(v.__class__, "__missing_class__", "unknown_class")
+            state = getattr(v, "_state", None)
+            if state is None and hasattr(v, "__dict__"):
+                state = dict(vars(v))
+            return {
+                "__missing__": {"module": str(module_name), "class": str(class_name)},
+                "_state": walk(state) if state is not None else {},
+            }
+
+        if hasattr(v, "__fields__"):
+            out: dict[str, Any] = {"__type__": type(v).__name__}
+            for fn in v.__fields__:
+                out[str(fn)] = walk(getattr(v, fn, None))
+            return out
+
+        if hasattr(v, "__dict__") and not isinstance(v, type):
+            out2: dict[str, Any] = {"__type__": type(v).__name__}
+            for k, vv in vars(v).items():
+                out2[str(k)] = walk(vv)
+            return out2
+
+        return {"__type__": type(v).__name__, "__repr__": repr(v)}
+
+    return walk(root)
+
+
 def _child_count(value: Any) -> int:
     if hasattr(value, "__fields__"):
         return len(value.__fields__)
@@ -919,6 +1249,98 @@ def _child_count(value: Any) -> int:
     if hasattr(value, "__dict__") and not isinstance(value, type):
         return len(vars(value))
     return 0
+
+
+_PENDING_ADD_CHILDREN_JOBS: dict[tuple[int, int], dict[str, Any]] = {}
+
+
+def _start_add_children_job(
+    tree: QTreeWidget,
+    parent: QTreeWidgetItem,
+    parent_value: Any,
+    *,
+    offset: int = 0,
+    total: int | None = None,
+) -> None:
+    """分批将 parent_value 的子项插入到 parent 下。"""
+    key = (id(tree), id(parent))
+    if key in _PENDING_ADD_CHILDREN_JOBS:
+        return
+    if total is None:
+        try:
+            total = _child_count(parent_value)
+        except Exception:
+            total = None
+
+    it = iter(_iter_children(parent_value))
+    skipped = 0
+    if offset > 0:
+        try:
+            while skipped < offset:
+                next(it)
+                skipped += 1
+        except StopIteration:
+            return
+
+    _PENDING_ADD_CHILDREN_JOBS[key] = {
+        "it": it,
+        "added": 0,
+        "offset": offset,
+        "total": total,
+        "parent_value": parent_value,
+    }
+
+    def step() -> None:
+        st = _PENDING_ADD_CHILDREN_JOBS.get(key)
+        if st is None:
+            return
+        # 如果 item 已经脱离树，直接停止
+        try:
+            if parent.treeWidget() is None or parent.treeWidget() is not tree:
+                _PENDING_ADD_CHILDREN_JOBS.pop(key, None)
+                return
+        except Exception:
+            _PENDING_ADD_CHILDREN_JOBS.pop(key, None)
+            return
+
+        tree.setUpdatesEnabled(False)
+        try:
+            batch = 0
+            while batch < _BATCH_ADD_CHILDREN and st["added"] < _MAX_CHILDREN:
+                try:
+                    k, v = next(st["it"])
+                except StopIteration:
+                    _PENDING_ADD_CHILDREN_JOBS.pop(key, None)
+                    break
+                _make_node(parent, str(k), v)
+                st["added"] += 1
+                batch += 1
+        finally:
+            tree.setUpdatesEnabled(True)
+
+        # 达到分页上限：插入 “more items” 并结束
+        st2 = _PENDING_ADD_CHILDREN_JOBS.get(key)
+        if st2 is None:
+            # iterator exhausted or cancelled; no more node
+            return
+        if st2["added"] >= _MAX_CHILDREN:
+            try:
+                total2 = st2.get("total")
+                next_offset = int(st2.get("offset") or 0) + int(st2.get("added") or 0)
+                remaining = None
+                if isinstance(total2, int) and total2 >= next_offset:
+                    remaining = total2 - next_offset
+                more = QTreeWidgetItem(parent, ["...", f"{remaining} more items" if remaining is not None else "more items", ""])
+                more.setForeground(1, QColor("#888"))
+                more.setData(0, Qt.ItemDataRole.UserRole, ("__more__", st2["parent_value"], next_offset))
+            finally:
+                _PENDING_ADD_CHILDREN_JOBS.pop(key, None)
+            return
+
+        # 还有剩余：下一帧继续
+        QTimer.singleShot(0, step)
+
+    QTimer.singleShot(0, step)
 
 
 def _add_children(parent: QTreeWidgetItem, value: Any) -> None:
@@ -949,6 +1371,22 @@ def _row_matches_search(field: str, needle: str, key: str, value: Any) -> bool:
     return n in blob
 
 
+def _row_matches_search_fields(
+    fields: set[str] | None, needle: str, key: str, value: Any
+) -> bool:
+    """多字段版匹配规则：fields=None 表示【全部字段】。"""
+    k0 = key
+    k1 = _node_label(value)
+    k2 = _type_label(value)
+    if fields is not None and k0 not in fields:
+        return False
+    n = needle.strip().lower()
+    if not n:
+        return fields is not None
+    blob = f"{k0}\n{k1}\n{k2}".lower()
+    return n in blob
+
+
 def _tree_expand_lazy_placeholder(tree: QTreeWidget, item: QTreeWidgetItem) -> bool:
     """若 item 下仅有懒加载占位子节点，则展开为真实子项。返回是否执行了展开。"""
     if item.childCount() != 1:
@@ -959,9 +1397,7 @@ def _tree_expand_lazy_placeholder(tree: QTreeWidget, item: QTreeWidgetItem) -> b
     item.removeChild(child)
     value = item.data(0, Qt.ItemDataRole.UserRole)
     if value is not None and value != _PLACEHOLDER:
-        tree.setUpdatesEnabled(False)
-        _add_children(item, value)
-        tree.setUpdatesEnabled(True)
+        _start_add_children_job(tree, item, value, offset=0, total=_child_count(value))
     return True
 
 
@@ -973,22 +1409,7 @@ def _tree_expand_one_more_chunk(tree: QTreeWidget, item: QTreeWidgetItem) -> boo
         if isinstance(meta, tuple) and len(meta) == 3 and meta[0] == "__more__":
             _, parent_value, offset = meta
             item.removeChild(ch)
-            tree.setUpdatesEnabled(False)
-            count = 0
-            for key, child_val in _iter_children(parent_value):
-                if count < offset:
-                    count += 1
-                    continue
-                if count >= offset + _MAX_CHILDREN:
-                    total = _child_count(parent_value)
-                    remaining = total - count
-                    more = QTreeWidgetItem(item, ["...", f"{remaining} more items", ""])
-                    more.setForeground(1, QColor("#888"))
-                    more.setData(0, Qt.ItemDataRole.UserRole, ("__more__", parent_value, count))
-                    break
-                _make_node(item, key, child_val)
-                count += 1
-            tree.setUpdatesEnabled(True)
+            _start_add_children_job(tree, item, parent_value, offset=int(offset), total=_child_count(parent_value))
             return True
     return False
 
@@ -1080,14 +1501,14 @@ class _DeepSearchThread(QThread):
     def __init__(
         self,
         root: Any,
-        field: str,
+        fields: set[str] | None,
         needle: str,
         job_gen: int,
         get_job_gen: Any,
     ) -> None:
         super().__init__()
         self._root = root
-        self._field = field
+        self._fields = fields
         self._needle = needle
         self._job_gen_at_start = job_gen
         self._get_job_gen = get_job_gen
@@ -1128,7 +1549,7 @@ class _DeepSearchThread(QThread):
                 if nodes % _DEEP_SEARCH_YIELD_NODES == 0:
                     flush()
                 sub = path + (key,)
-                if _row_matches_search(self._field, self._needle, key, child):
+                if _row_matches_search_fields(self._fields, self._needle, key, child):
                     batch.append(sub)
                     total += 1
                     if len(batch) >= _DEEP_SEARCH_BATCH:
@@ -1312,6 +1733,9 @@ class PklViewer(QMainWindow):
             self.setWindowTitle("PKL Viewer")
         self.resize(1300, 700)
         self._current_obj: Any = None
+        self._current_used_fallback = False
+        self._current_dirty = False
+        self._force_writeback = False
         self._load_thread: _LoadThread | None = None
         self._dot_timer = QTimer(self)
         self._dot_timer.setInterval(400)
@@ -1329,9 +1753,18 @@ class PklViewer(QMainWindow):
         self._all_field_keys_from_obj: set[str] = set()
         self._search_default_name_pending: bool = True
         self._search_combo_user_picked: bool = False
+        self._selected_search_fields: set[str] = {_SEARCH_DEFAULT_FIELD}
+        self._search_field_btn: QToolButton | None = None
+        self._search_field_menu: QMenu | None = None
         self._deep_search_running: bool = False
         self._search_first_nav_pending: bool = False
         self._detail_presets: list[dict[str, Any]] = self._load_detail_presets()
+        self._custom_search_fields: list[str] = self._load_search_field_presets()
+        self._replace_line: QLineEdit | None = None
+        self._replace_btn: QPushButton | None = None
+        self._save_btn: QPushButton | None = None
+        self._save_as_btn: QPushButton | None = None
+        self._force_writeback_check: QCheckBox | None = None
         self._rebuild_combo_timer = QTimer(self)
         self._rebuild_combo_timer.setSingleShot(True)
         self._rebuild_combo_timer.setInterval(200)
@@ -1423,15 +1856,34 @@ class PklViewer(QMainWindow):
         try:
             toolbar_lay = central.findChild(QHBoxLayout, "horizontalLayout_toolbar")
             if isinstance(toolbar_lay, QHBoxLayout):
+                save_btn = QPushButton("保存", central)
+                save_btn.setToolTip("将当前替换结果保存回 PKL 文件")
+                save_btn.clicked.connect(self._on_save)
+                save_as_btn = QPushButton("另存为...", central)
+                save_as_btn.setToolTip("将当前替换结果保存到新的 PKL 文件")
+                save_as_btn.clicked.connect(self._on_save_as)
+                force_check = QCheckBox("强制回写", central)
+                force_check.setToolTip(
+                    "允许在兼容模式下替换并保存（高风险：可能破坏原始数据结构，建议只用“另存为”）"
+                )
+                force_check.stateChanged.connect(self._on_force_writeback_changed)
                 restart_btn = QPushButton("重启程序", central)
                 restart_btn.setToolTip("重新拉起当前程序并退出（用于热更新 UI/代码）")
                 restart_btn.clicked.connect(self._on_restart_app)
-                # 尽量插在 reload 后面
+                insert_idx = toolbar_lay.indexOf(reload_btn) + 1
                 try:
-                    idx = toolbar_lay.indexOf(reload_btn)
-                    toolbar_lay.insertWidget(idx + 1, restart_btn)
+                    toolbar_lay.insertWidget(insert_idx, save_btn)
+                    toolbar_lay.insertWidget(insert_idx + 1, save_as_btn)
+                    toolbar_lay.insertWidget(insert_idx + 2, force_check)
+                    toolbar_lay.insertWidget(insert_idx + 3, restart_btn)
                 except Exception:
+                    toolbar_lay.addWidget(save_btn)
+                    toolbar_lay.addWidget(save_as_btn)
+                    toolbar_lay.addWidget(force_check)
                     toolbar_lay.addWidget(restart_btn)
+                self._save_btn = save_btn
+                self._save_as_btn = save_as_btn
+                self._force_writeback_check = force_check
         except Exception:
             traceback.print_exc()
             _log_exception("插入重启按钮失败")
@@ -1459,7 +1911,8 @@ class PklViewer(QMainWindow):
         self._search_field_combo = _require_ui_child(
             central, QComboBox, "searchFieldCombo"
         )
-        self._search_field_combo.activated.connect(self._on_search_field_user_activated)
+        # 旧版：单选 QComboBox。新版：隐藏 combo，使用可多选的 QToolButton + QMenu
+        self._search_field_combo.setVisible(False)
         self._search_line = _require_ui_child(central, QLineEdit, "searchLine")
         self._search_line.setSizePolicy(
             QSizePolicy.Policy.Expanding,
@@ -1472,6 +1925,64 @@ class PklViewer(QMainWindow):
             central, QPushButton, "searchNextButton"
         )
         self._search_next_btn.clicked.connect(self._on_tree_search_next)
+        try:
+            search_lay = central.findChild(QHBoxLayout, "horizontalLayout_search")
+            if isinstance(search_lay, QHBoxLayout):
+                # 用按钮替代字段名下拉（支持多选）
+                field_btn = QToolButton(central)
+                field_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+                field_btn.setToolTip("选择要匹配的字段名（可多选）；勾选【全部字段】表示不限制字段")
+                field_btn.setStyleSheet(
+                    "QToolButton { background: #2d2d2d; color: #d4d4d4; padding: 3px 10px; border: 1px solid #3c3c3c; } "
+                    "QToolButton:hover { background: #353535; } "
+                    "QToolButton:pressed { background: #3f3f3f; }"
+                )
+                menu = QMenu(field_btn)
+                menu.setStyleSheet(
+                    "QMenu { background: #2d2d2d; color: #d4d4d4; }"
+                    " QMenu::item:selected { background: #264f78; }"
+                )
+                field_btn.setMenu(menu)
+                self._search_field_btn = field_btn
+                self._search_field_menu = menu
+
+                # 放到原字段名下拉的位置（label_field 后面）
+                try:
+                    combo_idx = search_lay.indexOf(self._search_field_combo)
+                    if combo_idx >= 0:
+                        search_lay.insertWidget(combo_idx, field_btn)
+                except Exception:
+                    pass
+
+                search_fields_btn = QPushButton("字段设置...", central)
+                search_fields_btn.setToolTip("设置字段名下拉框中的自定义枚举值")
+                search_fields_btn.clicked.connect(self._on_edit_search_fields)
+                replace_label = QLabel("替换为", central)
+                replace_label.setStyleSheet("color: #aaa; font-size: 12px;")
+                replace_line = QLineEdit(central)
+                replace_line.setPlaceholderText("支持留空，用于删除表情或其它文本")
+                replace_line.setStyleSheet(
+                    "QLineEdit { background: #2d2d2d; color: #d4d4d4; border: 1px solid #3c3c3c; padding: 4px 8px; }"
+                )
+                replace_line.returnPressed.connect(self._on_replace_all)
+                replace_btn = QPushButton("替换全部", central)
+                replace_btn.setStyleSheet(
+                    "QPushButton { background: #8b5cf6; color: #fff; padding: 4px 8px; border: none; } "
+                    "QPushButton:hover:enabled { background: #9d72ff; } "
+                    "QPushButton:pressed:enabled { background: #7447d6; } "
+                    "QPushButton:disabled { background: #4d3d70; color: #b9abd9; }"
+                )
+                replace_btn.clicked.connect(self._on_replace_all)
+                insert_idx = search_lay.indexOf(self._search_next_btn) + 1
+                search_lay.insertWidget(insert_idx, search_fields_btn)
+                search_lay.insertWidget(insert_idx + 1, replace_label)
+                search_lay.insertWidget(insert_idx + 2, replace_line, 1)
+                search_lay.insertWidget(insert_idx + 3, replace_btn)
+                self._replace_line = replace_line
+                self._replace_btn = replace_btn
+        except Exception:
+            traceback.print_exc()
+            _log_exception("插入替换控件失败")
 
         self._log_view = _require_ui_child(central, QTextEdit, "logView")
         log_hint = _require_ui_child(central, QLabel, "logHintLabel")
@@ -1566,6 +2077,80 @@ class PklViewer(QMainWindow):
         self._status = QStatusBar()
         self.setStatusBar(self._status)
         self.setStyleSheet("QMainWindow { background: #252526; }")
+        self._refresh_path_label()
+        self._update_edit_action_state()
+        self._rebuild_search_field_combo()
+
+    def _refresh_path_label(self) -> None:
+        path = self._path_label.toolTip().strip()
+        if not path:
+            self._path_label.setText("未加载文件")
+            return
+        name = Path(path).name
+        tags: list[str] = []
+        if self._current_used_fallback:
+            tags.append("兼容模式")
+            if self._force_writeback:
+                tags.append("强制回写")
+        if self._current_dirty:
+            tags.append("已修改")
+        if tags:
+            name += "  [" + " | ".join(tags) + "]"
+        self._path_label.setText(name)
+
+    def _update_edit_action_state(self) -> None:
+        has_obj = self._current_obj is not None
+        can_mutate = has_obj and (self._force_writeback or not self._current_used_fallback)
+        if isinstance(self._replace_line, QLineEdit):
+            self._replace_line.setEnabled(has_obj)
+            if self._current_used_fallback:
+                self._replace_line.setToolTip(
+                    "兼容模式下默认不支持安全回写；如确需修改，请勾选“强制回写”（高风险）"
+                )
+            else:
+                self._replace_line.setToolTip("支持留空，用于删除表情或其它文本")
+        if isinstance(self._replace_btn, QPushButton):
+            self._replace_btn.setEnabled(has_obj)
+            if self._current_used_fallback:
+                self._replace_btn.setToolTip(
+                    "兼容模式下默认不允许回写；如确需修改，请勾选“强制回写”（高风险）"
+                )
+            else:
+                self._replace_btn.setToolTip("按当前字段 + 搜索词，替换对象中的所有字符串值")
+        if isinstance(self._save_btn, QPushButton):
+            self._save_btn.setEnabled(can_mutate and self._current_dirty)
+        if isinstance(self._save_as_btn, QPushButton):
+            self._save_as_btn.setEnabled(can_mutate)
+        if isinstance(self._force_writeback_check, QCheckBox):
+            self._force_writeback_check.setEnabled(has_obj and self._current_used_fallback)
+
+    def _on_force_writeback_changed(self, state: int) -> None:
+        self._force_writeback = bool(state)
+        if self._force_writeback and self._current_used_fallback:
+            QMessageBox.warning(
+                self,
+                "强制回写（高风险）",
+                "你已开启“强制回写”。\n\n"
+                "兼容模式表示原始类缺失，当前对象含降级占位类型；强行保存后，"
+                "原始结构可能无法被其它程序正确读取。\n\n"
+                "强烈建议：优先用“另存为...”保存到新文件，并保留原文件备份。",
+            )
+        self._refresh_path_label()
+        self._update_edit_action_state()
+
+    def _current_file_path(self) -> str:
+        return self._path_label.toolTip().strip()
+
+    @staticmethod
+    def _tree_item_path(item: QTreeWidgetItem | None) -> tuple[str, ...] | None:
+        if item is None:
+            return None
+        parts: list[str] = []
+        cur: QTreeWidgetItem | None = item
+        while cur is not None:
+            parts.append(cur.text(0))
+            cur = cur.parent()
+        return tuple(reversed(parts))
 
     def _load_detail_presets(self) -> list[dict[str, Any]]:
         try:
@@ -1590,6 +2175,27 @@ class PklViewer(QMainWindow):
         except Exception:
             traceback.print_exc()
             _log_exception("保存完整预设失败")
+
+    def _load_search_field_presets(self) -> list[str]:
+        try:
+            if _SEARCH_FIELD_PRESET_FILE.is_file():
+                data = json.loads(_SEARCH_FIELD_PRESET_FILE.read_text(encoding="utf-8"))
+                return _normalize_search_field_list(data)
+        except Exception:
+            traceback.print_exc()
+            _log_exception("读取字段名设置失败")
+        return []
+
+    def _save_search_field_presets(self) -> None:
+        try:
+            _SEARCH_FIELD_PRESET_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _SEARCH_FIELD_PRESET_FILE.write_text(
+                json.dumps(self._custom_search_fields, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            traceback.print_exc()
+            _log_exception("保存字段名设置失败")
 
     def _refresh_detail_preset_combo(self, selected_name: str | None = None) -> None:
         combo = getattr(self, "_detail_preset_combo", None)
@@ -1661,6 +2267,15 @@ class PklViewer(QMainWindow):
         except Exception:
             traceback.print_exc()
             _log_exception("刷新详情失败")
+
+    def _on_edit_search_fields(self) -> None:
+        dlg = _SearchFieldSettingsDialog(self, self._custom_search_fields)
+        if dlg.exec() != int(QDialog.DialogCode.Accepted):
+            return
+        self._custom_search_fields = dlg.build_fields()
+        self._save_search_field_presets()
+        self._rebuild_search_field_combo()
+        self._status.showMessage("字段名设置已更新", 3000)
 
     def _apply_detail_preview_visibility(self, *, show_text: bool, show_tree: bool) -> None:
         self._detail.setVisible(bool(show_text))
@@ -1805,20 +2420,38 @@ class PklViewer(QMainWindow):
         return item
 
     def _rebuild_search_field_combo(self) -> None:
-        """用后台收集到的键名重建字段下拉框（不扫描树，避免展开卡顿）。"""
-        cur = self._search_field_combo.currentText()
-        self._search_field_combo.blockSignals(True)
-        self._search_field_combo.clear()
-        self._search_field_combo.addItem(_SEARCH_ALL_FIELDS)
-        keys: set[str] = set(self._all_field_keys_from_obj)
-        for k in sorted(keys, key=lambda s: (s.lower(), s)):
-            self._search_field_combo.addItem(k)
-        self._search_field_combo.blockSignals(False)
-        idx = self._search_field_combo.findText(cur, Qt.MatchFlag.MatchExactly)
-        if idx >= 0:
-            self._search_field_combo.setCurrentIndex(idx)
-        elif not self._search_combo_user_picked:
-            self._maybe_select_default_search_field()
+        """字段名菜单只显示固定项和用户在设置中配置的自定义项（支持多选）。"""
+        menu = self._search_field_menu
+        btn = self._search_field_btn
+        if not isinstance(menu, QMenu) or not isinstance(btn, QToolButton):
+            return
+
+        ordered_fields: list[str] = []
+        seen: set[str] = set()
+        for k in _SEARCH_FIXED_FIELDS:
+            if k not in seen:
+                ordered_fields.append(k)
+                seen.add(k)
+        for k in self._custom_search_fields:
+            if k not in seen:
+                ordered_fields.append(k)
+                seen.add(k)
+
+        # 清理已选，避免保留不存在的字段
+        self._selected_search_fields = {
+            f for f in self._selected_search_fields if (f in seen or f == _SEARCH_ALL_FIELDS)
+        }
+        if not self._selected_search_fields:
+            self._selected_search_fields = {_SEARCH_DEFAULT_FIELD}
+
+        menu.clear()
+        for f in ordered_fields:
+            act = menu.addAction(f)
+            act.setCheckable(True)
+            act.setChecked(f in self._selected_search_fields)
+            act.triggered.connect(lambda _checked=False, name=f: self._on_toggle_search_field(name))
+
+        self._update_search_field_button_text()
 
     def _tree_item_matches(self, field: str, needle: str, item: QTreeWidgetItem) -> bool:
         """与后台深度搜索使用同一套规则（有绑定值时用对象算标签）。"""
@@ -1864,9 +2497,9 @@ class PklViewer(QMainWindow):
         if self._current_obj is None:
             self._status.showMessage("请先加载 PKL 文件", 3000)
             return
-        field = self._search_field_combo.currentText()
+        fields = self._current_search_fields()
         needle = self._search_line.text()
-        if field == _SEARCH_ALL_FIELDS and not needle.strip():
+        if fields is None and not needle.strip():
             self._status.showMessage("选择「全部字段」时请至少输入一个搜索子串", 3500)
             return
 
@@ -1879,7 +2512,7 @@ class PklViewer(QMainWindow):
 
         th = _DeepSearchThread(
             self._current_obj,
-            field,
+            fields,
             needle,
             job_gen,
             lambda: self._search_job_gen,
@@ -2150,6 +2783,221 @@ class PklViewer(QMainWindow):
             return
         QApplication.quit()
 
+    def _on_replace_all(self) -> None:
+        if self._current_obj is None:
+            QMessageBox.information(self, "无法替换", "请先加载 PKL 文件。")
+            self._status.showMessage("请先加载 PKL 文件", 3000)
+            return
+        if self._current_used_fallback:
+            if not self._force_writeback:
+                QMessageBox.warning(
+                    self,
+                    "无法替换并保存",
+                    "当前 PKL 是以兼容模式打开的（原始类缺失），默认不允许回写。\n\n"
+                    "如果你确定要强制替换并保存，请先勾选工具栏的“强制回写”（高风险，建议只用“另存为...”）。",
+                )
+                return
+        replace_line = self._replace_line
+        if not isinstance(replace_line, QLineEdit):
+            QMessageBox.critical(self, "无法替换", "替换输入框初始化失败。")
+            self._status.showMessage("替换输入框初始化失败", 3000)
+            return
+        fields = self._current_search_fields()
+        needle = self._search_line.text()
+        replacement = replace_line.text()
+        if fields is None and not needle:
+            QMessageBox.information(self, "无法替换", "请先输入要替换的搜索文本。")
+            self._status.showMessage("请先输入要替换的搜索文本", 3000)
+            return
+        if not needle:
+            QMessageBox.information(
+                self,
+                "无法替换",
+                "指定字段替换时也需要提供搜索文本。",
+            )
+            self._status.showMessage("指定字段替换时也需要提供搜索文本", 3000)
+            return
+
+        progress = QProgressDialog("正在替换文本，请稍候...", None, 0, 0, self)
+        progress.setWindowTitle("替换中")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setCancelButton(None)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.show()
+
+        old_btn_text = ""
+        if isinstance(self._replace_btn, QPushButton):
+            old_btn_text = self._replace_btn.text()
+            self._replace_btn.setText("替换中...")
+            self._replace_btn.setEnabled(False)
+        self._status.showMessage("正在替换文本...", 0)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()
+
+        try:
+            selected_path = self._tree_item_path(self._tree.currentItem())
+            new_root, values_changed, total_replacements = _replace_strings_in_object(
+                self._current_obj,
+                fields=fields,
+                needle=needle,
+                replacement=replacement,
+            )
+            if values_changed <= 0:
+                QMessageBox.information(
+                    self,
+                    "未找到替换项",
+                    "未找到可替换的字符串值。\n如果内容在嵌套字典里，建议先试试字段选择“【全部字段】”。",
+                )
+                self._status.showMessage("未找到可替换的字符串值", 4000)
+                return
+
+            self._current_obj = new_root
+            self._current_dirty = True
+            self._refresh_tree(self._current_obj)
+            if selected_path:
+                item = self._find_tree_item_for_path(selected_path)
+                if item is not None:
+                    self._ensure_tree_item_visible(item)
+            self._refresh_path_label()
+            self._update_edit_action_state()
+            self._status.showMessage(
+                f"替换完成：共修改 {values_changed} 个字符串值，命中 {total_replacements} 次；请记得保存",
+                6000,
+            )
+            QMessageBox.information(
+                self,
+                "替换完成",
+                f"共修改 {values_changed} 个字符串值，命中 {total_replacements} 次。\n如果结果符合预期，请继续点击“保存”或“另存为...”。",
+            )
+        finally:
+            if isinstance(self._replace_btn, QPushButton):
+                self._replace_btn.setText(old_btn_text or "替换全部")
+            self._update_edit_action_state()
+            progress.close()
+            QApplication.restoreOverrideCursor()
+
+    def _on_toggle_search_field(self, name: str) -> None:
+        # 特殊项：全部字段互斥
+        if name == _SEARCH_ALL_FIELDS:
+            self._selected_search_fields = {_SEARCH_ALL_FIELDS}
+        else:
+            if _SEARCH_ALL_FIELDS in self._selected_search_fields:
+                self._selected_search_fields.discard(_SEARCH_ALL_FIELDS)
+            if name in self._selected_search_fields:
+                self._selected_search_fields.discard(name)
+            else:
+                self._selected_search_fields.add(name)
+        if not self._selected_search_fields:
+            self._selected_search_fields = {_SEARCH_DEFAULT_FIELD}
+        self._update_search_field_button_text()
+
+    def _update_search_field_button_text(self) -> None:
+        btn = self._search_field_btn
+        if not isinstance(btn, QToolButton):
+            return
+        if _SEARCH_ALL_FIELDS in self._selected_search_fields:
+            btn.setText(_SEARCH_ALL_FIELDS)
+            return
+        items = sorted(self._selected_search_fields, key=lambda s: (s.lower(), s))
+        if not items:
+            btn.setText(_SEARCH_DEFAULT_FIELD)
+            return
+        if len(items) <= 2:
+            btn.setText(", ".join(items))
+            return
+        btn.setText(f"{items[0]}, {items[1]} +{len(items) - 2}")
+
+    def _current_search_fields(self) -> set[str] | None:
+        """None 表示【全部字段】。"""
+        if _SEARCH_ALL_FIELDS in self._selected_search_fields:
+            return None
+        return set(self._selected_search_fields)
+
+    def _save_current_obj_to_path(self, path: str) -> bool:
+        if self._current_obj is None:
+            self._status.showMessage("没有可保存的对象", 3000)
+            return False
+        if self._current_used_fallback:
+            if not self._force_writeback:
+                QMessageBox.warning(
+                    self,
+                    "无法保存",
+                    "当前 PKL 是以兼容模式打开的（原始类缺失），默认不允许回写。\n\n"
+                    "如需强制保存，请先勾选“强制回写”（高风险，建议只用“另存为...”）。",
+                )
+                return False
+            ans = QMessageBox.question(
+                self,
+                "确认强制回写？",
+                "你正在兼容模式下强制保存。\n\n"
+                "这可能破坏原始数据结构，导致其它程序无法正常读取。\n\n"
+                "是否继续？（建议优先另存为）",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return False
+
+        target = Path(path)
+        try:
+            obj_to_dump = self._current_obj
+            if self._current_used_fallback:
+                mode = QMessageBox.question(
+                    self,
+                    "保存方式",
+                    "当前处于兼容模式。\n\n"
+                    "Yes：保存为【可移植 PKL（无依赖）】——任何程序都能反序列化，但类型会变成普通 dict/list 数据。\n"
+                    "No：保存为【占位类 PKL】——可能依赖本工具模块/缺失类型模块。\n\n"
+                    "是否选择可移植保存？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if mode == QMessageBox.StandardButton.Yes:
+                    obj_to_dump = _make_portable_pickle_data(self._current_obj)
+
+            payload = pickle.dumps(obj_to_dump, protocol=pickle.HIGHEST_PROTOCOL)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                backup_path = target.with_name(target.name + ".bak")
+                backup_path.write_bytes(target.read_bytes())
+            temp_path = target.with_name(target.name + ".tmp")
+            temp_path.write_bytes(payload)
+            temp_path.replace(target)
+        except Exception as e:
+            traceback.print_exc()
+            _log_exception(f"保存 PKL 失败: {path}")
+            QMessageBox.critical(self, "保存失败", f"保存 PKL 失败：\n{e}")
+            return False
+
+        resolved_path = str(target.resolve())
+        self._history.push(resolved_path)
+        self._refresh_history_list()
+        self._path_label.setToolTip(resolved_path)
+        self._current_dirty = False
+        self._refresh_path_label()
+        self._update_edit_action_state()
+        self._status.showMessage(f"已保存: {resolved_path}", 5000)
+        return True
+
+    def _on_save(self) -> None:
+        path = self._current_file_path()
+        if not path:
+            self._status.showMessage("请先加载 PKL 文件", 3000)
+            return
+        self._save_current_obj_to_path(path)
+
+    def _on_save_as(self) -> None:
+        current_path = self._current_file_path()
+        initial_path = current_path or ""
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "另存为 PKL 文件",
+            initial_path,
+            "Pickle 文件 (*.pkl);;所有文件 (*)",
+        )
+        if path:
+            self._save_current_obj_to_path(path)
+
     def _load_file(self, path: str) -> None:
         if self._load_thread and self._load_thread.isRunning():
             self._load_thread.quit()
@@ -2161,6 +3009,9 @@ class PklViewer(QMainWindow):
         self._history.push(path)
         self._refresh_history_list()
 
+        self._current_obj = None
+        self._current_used_fallback = False
+        self._current_dirty = False
         self._loading_path = path
         self._dot_count = 0
         self._dot_timer.start()
@@ -2168,6 +3019,9 @@ class PklViewer(QMainWindow):
         self._tree.clear()
         self._detail.clear()
         self._set_detail_tree_message("等待选择节点")
+        self._path_label.setToolTip(path)
+        self._refresh_path_label()
+        self._update_edit_action_state()
 
         thread = _LoadThread(path)
         thread.done.connect(lambda obj, t, fallback: self._on_loaded(obj, t, path, fallback))
@@ -2190,8 +3044,11 @@ class PklViewer(QMainWindow):
     def _on_loaded(self, obj: Any, type_name: str, path: str, used_fallback: bool) -> None:
         self._dot_timer.stop()
         self._current_obj = obj
-        self._path_label.setText(Path(path).name)
+        self._current_used_fallback = used_fallback
+        self._current_dirty = False
         self._path_label.setToolTip(path)
+        self._refresh_path_label()
+        self._update_edit_action_state()
         self._status.showMessage("构建树中...", 0)
         QApplication.processEvents()
         self._refresh_tree(obj)
