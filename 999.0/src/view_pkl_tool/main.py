@@ -1414,6 +1414,20 @@ def _tree_expand_one_more_chunk(tree: QTreeWidget, item: QTreeWidgetItem) -> boo
     return False
 
 
+def _tree_expand_more_item(tree: QTreeWidget, item: QTreeWidgetItem) -> bool:
+    """若 item 本身是分页占位节点，则加载下一批兄弟节点。"""
+    meta = item.data(0, Qt.ItemDataRole.UserRole)
+    if not (isinstance(meta, tuple) and len(meta) == 3 and meta[0] == "__more__"):
+        return False
+    parent = item.parent()
+    if parent is None:
+        return False
+    _, parent_value, offset = meta
+    parent.removeChild(item)
+    _start_add_children_job(tree, parent, parent_value, offset=int(offset), total=_child_count(parent_value))
+    return True
+
+
 def _make_node(parent: QTreeWidgetItem | QTreeWidget, key: str, value: Any) -> QTreeWidgetItem:
     label = _node_label(value)
     tname = _type_label(value)
@@ -1993,6 +2007,7 @@ class PklViewer(QMainWindow):
         hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self._tree.itemExpanded.connect(self._on_item_expanded)
+        self._tree.itemDoubleClicked.connect(self._on_item_double_clicked)
         self._tree.currentItemChanged.connect(self._on_item_selected)
         self._detail.setFont(QFont("Consolas", 12))
         self._log_view.setFont(QFont("Consolas", 10))
@@ -3084,6 +3099,11 @@ class PklViewer(QMainWindow):
         if _tree_expand_lazy_placeholder(self._tree, item):
             return
         if _tree_expand_one_more_chunk(self._tree, item):
+            return
+
+    def _on_item_double_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
+        if _tree_expand_more_item(self._tree, item):
+            self._status.showMessage("已加载更多条目", 2000)
             return
 
     def _on_item_selected(self, current: QTreeWidgetItem | None, _prev: QTreeWidgetItem | None) -> None:
