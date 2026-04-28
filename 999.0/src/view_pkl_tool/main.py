@@ -11,6 +11,13 @@ import logging
 import math
 import pickle
 import subprocess
+
+try:
+    import pyfory
+    HAS_FORY = True
+except ImportError:
+    pyfory = None
+    HAS_FORY = False
 import sys
 import traceback
 import types
@@ -917,26 +924,40 @@ class _History:
 
 
 class _LoadThread(QThread):
-    done: Signal = Signal(object, str, bool)
+    done: Signal = Signal(object, str, bool, str)  # obj, type_name, used_fallback, format_label
     error: Signal = Signal(str)
 
     def __init__(self, path: str) -> None:
         super().__init__()
         self._path = path
+        self._is_fory = Path(path).suffix.lower() == ".fory"
 
     def run(self) -> None:
         try:
             raw = Path(self._path).read_bytes()
             used_fallback = False
-            try:
-                obj = pickle.loads(raw)
-            except Exception:
-                obj = TolerantUnpickler(io.BytesIO(raw)).load()
-                used_fallback = True
-            self.done.emit(obj, type(obj).__name__, used_fallback)
+            if self._is_fory:
+                if not HAS_FORY:
+                    self.error.emit(
+                        "缺少 pyfory 库，无法加载 .fory 文件。\n"
+                        "请执行: pip install pyfory"
+                    )
+                    return
+                fory = pyfory.Fory(xlang=False, ref=True, strict=False)
+                obj = fory.loads(raw)
+                fmt_label = "Fory"
+            else:
+                try:
+                    obj = pickle.loads(raw)
+                    fmt_label = "Pickle"
+                except Exception:
+                    obj = TolerantUnpickler(io.BytesIO(raw)).load()
+                    used_fallback = True
+                    fmt_label = "Pickle 兼容模式"
+            self.done.emit(obj, type(obj).__name__, used_fallback, fmt_label)
         except Exception as e:
             traceback.print_exc()
-            _log_exception(f"加载 PKL 失败: {self._path}")
+            _log_exception(f"加载失败: {self._path}")
             self.error.emit(str(e))
 
 
@@ -1749,7 +1770,7 @@ class PklViewer(QMainWindow):
         self._current_obj: Any = None
         self._current_used_fallback = False
         self._current_dirty = False
-        self._force_writeback = False
+        self._force_writeback = True
         self._load_thread: _LoadThread | None = None
         self._dot_timer = QTimer(self)
         self._dot_timer.setInterval(400)
@@ -1874,12 +1895,13 @@ class PklViewer(QMainWindow):
                 save_btn.setToolTip("将当前替换结果保存回 PKL 文件")
                 save_btn.clicked.connect(self._on_save)
                 save_as_btn = QPushButton("另存为...", central)
-                save_as_btn.setToolTip("将当前替换结果保存到新的 PKL 文件")
+                save_as_btn.setToolTip("将当前数据另存为 PKL 或 Fory 文件")
                 save_as_btn.clicked.connect(self._on_save_as)
                 force_check = QCheckBox("强制回写", central)
                 force_check.setToolTip(
                     "允许在兼容模式下替换并保存（高风险：可能破坏原始数据结构，建议只用“另存为”）"
                 )
+                force_check.setChecked(True)
                 force_check.stateChanged.connect(self._on_force_writeback_changed)
                 restart_btn = QPushButton("重启程序", central)
                 restart_btn.setToolTip("重新拉起当前程序并退出（用于热更新 UI/代码）")
@@ -2719,7 +2741,7 @@ class PklViewer(QMainWindow):
             self,
             "重新选择 PKL 文件",
             initial_dir,
-            "Pickle 文件 (*.pkl);;所有文件 (*)",
+            "数据文件 (*.pkl *.fory);;Pickle 文件 (*.pkl);;Fory 文件 (*.fory);;所有文件 (*)",
         )
         if path:
             self._load_file(path)
@@ -2770,7 +2792,7 @@ class PklViewer(QMainWindow):
 
     def _on_open(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "选择 PKL 文件", "", "Pickle 文件 (*.pkl);;所有文件 (*)"
+            self, "选择数据文件", "", "数据文件 (*.pkl *.fory);;Pickle 文件 (*.pkl);;Fory 文件 (*.fory);;所有文件 (*)"
         )
         if path:
             self._load_file(path)
@@ -2930,11 +2952,28 @@ class PklViewer(QMainWindow):
             return None
         return set(self._selected_search_fields)
 
-    def _save_current_obj_to_path(self, path: str) -> bool:
+    def _save_to_file(self, path: str) -> bool:
+        """根据扩展名选择序列化方式保存当前对象到文件。"""
         if self._current_obj is None:
             self._status.showMessage("没有可保存的对象", 3000)
             return False
-        if self._current_used_fallback:
+
+        target = Path(path)
+        ext = target.suffix.lower()
+        is_fory = ext == ".fory"
+
+        # 如果目标是 .fory 但 pyfory 不可用，提前拦截
+        if is_fory and not HAS_FORY:
+            QMessageBox.warning(
+                self,
+                "无法保存",
+                "pyfory 未安装，无法保存为 Fory 格式。\n\n"
+                "请执行: pip install pyfory",
+            )
+            return False
+
+        # 兼容模式保护（仅 pickle 格式需要检查）
+        if not is_fory and self._current_used_fallback:
             if not self._force_writeback:
                 QMessageBox.warning(
                     self,
@@ -2954,23 +2993,33 @@ class PklViewer(QMainWindow):
             if ans != QMessageBox.StandardButton.Yes:
                 return False
 
-        target = Path(path)
         try:
             obj_to_dump = self._current_obj
-            if self._current_used_fallback:
-                mode = QMessageBox.question(
-                    self,
-                    "保存方式",
-                    "当前处于兼容模式。\n\n"
-                    "Yes：保存为【可移植 PKL（无依赖）】——任何程序都能反序列化，但类型会变成普通 dict/list 数据。\n"
-                    "No：保存为【占位类 PKL】——可能依赖本工具模块/缺失类型模块。\n\n"
-                    "是否选择可移植保存？",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                )
-                if mode == QMessageBox.StandardButton.Yes:
-                    obj_to_dump = _make_portable_pickle_data(self._current_obj)
 
-            payload = pickle.dumps(obj_to_dump, protocol=pickle.HIGHEST_PROTOCOL)
+            if is_fory:
+                # Fory 序列化 —— 先将动态占位类型转为纯内置类型，
+                # 避免 pyfory 序列化自定义类的模块路径导致加载时 import 失败
+                obj_to_dump = _make_portable_pickle_data(obj_to_dump)
+                fory = pyfory.Fory(xlang=False, ref=True, strict=False)
+                payload = fory.dumps(obj_to_dump)
+                fmt_label = "Fory 格式"
+            else:
+                # Pickle 序列化（含兼容模式可移植选项）
+                if self._current_used_fallback:
+                    mode = QMessageBox.question(
+                        self,
+                        "保存方式",
+                        "当前处于兼容模式。\n\n"
+                        "Yes：保存为【可移植 PKL（无依赖）】——任何程序都能反序列化，但类型会变成普通 dict/list 数据。\n"
+                        "No：保存为【占位类 PKL】——可能依赖本工具模块/缺失类型模块。\n\n"
+                        "是否选择可移植保存？",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    )
+                    if mode == QMessageBox.StandardButton.Yes:
+                        obj_to_dump = _make_portable_pickle_data(self._current_obj)
+                payload = pickle.dumps(obj_to_dump, protocol=pickle.HIGHEST_PROTOCOL)
+                fmt_label = "Pickle 格式"
+
             target.parent.mkdir(parents=True, exist_ok=True)
             if target.exists():
                 backup_path = target.with_name(target.name + ".bak")
@@ -2980,8 +3029,8 @@ class PklViewer(QMainWindow):
             temp_path.replace(target)
         except Exception as e:
             traceback.print_exc()
-            _log_exception(f"保存 PKL 失败: {path}")
-            QMessageBox.critical(self, "保存失败", f"保存 PKL 失败：\n{e}")
+            _log_exception(f"保存文件失败: {path}")
+            QMessageBox.critical(self, "保存失败", f"保存文件失败：\n{e}")
             return False
 
         resolved_path = str(target.resolve())
@@ -2991,27 +3040,32 @@ class PklViewer(QMainWindow):
         self._current_dirty = False
         self._refresh_path_label()
         self._update_edit_action_state()
-        self._status.showMessage(f"已保存: {resolved_path}", 5000)
+        self._status.showMessage(f"已保存: {resolved_path} ({fmt_label})", 5000)
         return True
+
+    def _save_current_obj_to_path(self, path: str) -> bool:
+        """向后兼容：旧调用点仍使用此方法名。"""
+        return self._save_to_file(path)
 
     def _on_save(self) -> None:
         path = self._current_file_path()
         if not path:
-            self._status.showMessage("请先加载 PKL 文件", 3000)
+            self._on_save_as()
             return
-        self._save_current_obj_to_path(path)
+        self._save_to_file(path)
 
     def _on_save_as(self) -> None:
         current_path = self._current_file_path()
         initial_path = current_path or ""
-        path, _ = QFileDialog.getSaveFileName(
+        filters = "Pickle 文件 (*.pkl);;Fory 文件 (*.fory);;所有文件 (*)"
+        path, selected_filter = QFileDialog.getSaveFileName(
             self,
-            "另存为 PKL 文件",
+            "另存为",
             initial_path,
-            "Pickle 文件 (*.pkl);;所有文件 (*)",
+            filters,
         )
         if path:
-            self._save_current_obj_to_path(path)
+            self._save_to_file(path)
 
     def _load_file(self, path: str) -> None:
         if self._load_thread and self._load_thread.isRunning():
@@ -3039,7 +3093,7 @@ class PklViewer(QMainWindow):
         self._update_edit_action_state()
 
         thread = _LoadThread(path)
-        thread.done.connect(lambda obj, t, fallback: self._on_loaded(obj, t, path, fallback))
+        thread.done.connect(lambda obj, t, fallback, fmt: self._on_loaded(obj, t, path, fallback, fmt))
         thread.error.connect(self._on_load_error)
         thread.start()
         self._load_thread = thread
@@ -3055,8 +3109,10 @@ class PklViewer(QMainWindow):
         self._dot_timer.stop()
         print(f"[PKL Viewer] 加载失败: {msg}", file=sys.stderr, flush=True)
         self._status.clearMessage()
+        QMessageBox.critical(self, "加载失败", f"无法加载文件：\n{msg}")
 
-    def _on_loaded(self, obj: Any, type_name: str, path: str, used_fallback: bool) -> None:
+    def _on_loaded(self, obj: Any, type_name: str, path: str, used_fallback: bool,
+                    fmt_label: str = "Pickle") -> None:
         self._dot_timer.stop()
         self._current_obj = obj
         self._current_used_fallback = used_fallback
@@ -3068,7 +3124,7 @@ class PklViewer(QMainWindow):
         QApplication.processEvents()
         self._refresh_tree(obj)
         suffix = " | 已使用兼容模式(缺失类已降级)" if used_fallback else ""
-        self._status.showMessage(f"{path}  |  类型: {type_name}{suffix}", 0)
+        self._status.showMessage(f"{path}  |  格式: {fmt_label}  |  类型: {type_name}{suffix}", 0)
         self._refresh_history_list()
 
     def _refresh_tree(self, obj: Any) -> None:
