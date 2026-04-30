@@ -70,6 +70,49 @@
       </widget>
      </item>
      <item>
+      <widget class="QPushButton" name="saveButton">
+       <property name="text">
+        <string>保存</string>
+       </property>
+       <property name="toolTip">
+        <string>将当前替换结果保存回 PKL 文件</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="saveAsButton">
+       <property name="text">
+        <string>另存为...</string>
+       </property>
+       <property name="toolTip">
+        <string>将当前数据另存为 PKL 或 Fory 文件</string>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QCheckBox" name="forceWritebackCheck">
+       <property name="text">
+        <string>强制回写</string>
+       </property>
+       <property name="toolTip">
+        <string>允许在兼容模式下替换并保存（高风险：可能破坏原始数据结构，建议只用“另存为”）</string>
+       </property>
+       <property name="checked">
+        <bool>true</bool>
+       </property>
+      </widget>
+     </item>
+     <item>
+      <widget class="QPushButton" name="restartButton">
+       <property name="text">
+        <string>重启程序</string>
+       </property>
+       <property name="toolTip">
+        <string>重新拉起当前程序并退出（用于热更新 UI/代码）</string>
+       </property>
+      </widget>
+     </item>
+     <item>
       <spacer name="horizontalSpacer_toolbar">
        <property name="orientation">
         <enum>Qt::Horizontal</enum>
@@ -196,6 +239,22 @@
           </widget>
          </item>
          <item>
+          <widget class="QToolButton" name="searchFieldButton">
+           <property name="text">
+            <string>字段：name</string>
+           </property>
+           <property name="toolTip">
+            <string>选择要匹配的字段名（可多选）；勾选【全部字段】表示不限制字段</string>
+           </property>
+           <property name="popupMode">
+            <enum>QToolButton::InstantPopup</enum>
+           </property>
+           <property name="styleSheet">
+            <string notr="true">QToolButton { background: #2d2d2d; color: #d4d4d4; padding: 3px 10px; border: 1px solid #3c3c3c; } QToolButton:hover { background: #353535; } QToolButton:pressed { background: #3f3f3f; }</string>
+           </property>
+          </widget>
+         </item>
+         <item>
           <widget class="QLabel" name="label_search">
            <property name="text">
             <string>搜索</string>
@@ -256,6 +315,46 @@
            </property>
            <property name="text">
             <string>下一个</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="searchFieldsButton">
+           <property name="text">
+            <string>字段设置...</string>
+           </property>
+           <property name="toolTip">
+            <string>设置字段名下拉框中的自定义枚举值</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLabel" name="replaceLabel">
+           <property name="text">
+            <string>替换为</string>
+           </property>
+           <property name="styleSheet">
+            <string notr="true">color: #aaa; font-size: 12px;</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLineEdit" name="replaceLine">
+           <property name="placeholderText">
+            <string>支持留空，用于删除表情或其它文本</string>
+           </property>
+           <property name="styleSheet">
+            <string notr="true">QLineEdit { background: #2d2d2d; color: #d4d4d4; border: 1px solid #3c3c3c; padding: 4px 8px; }</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="replaceButton">
+           <property name="text">
+            <string>替换全部</string>
+           </property>
+           <property name="styleSheet">
+            <string notr="true">QPushButton { background: #8b5cf6; color: #fff; padding: 4px 8px; border: none; } QPushButton:hover:enabled { background: #9d72ff; } QPushButton:pressed:enabled { background: #7447d6; } QPushButton:disabled { background: #4d3d70; color: #b9abd9; }</string>
            </property>
           </widget>
          </item>
@@ -372,14 +471,173 @@
            </property>
           </column>
          </widget>
-         <widget class="QTextEdit" name="detailText">
-          <property name="readOnly">
-           <bool>true</bool>
+        <widget class="QWidget" name="detailWrap">
+         <layout class="QVBoxLayout" name="verticalLayout_detailWrap">
+          <property name="spacing">
+           <number>4</number>
           </property>
-          <property name="styleSheet">
-           <string notr="true">background: #1e1e1e; color: #ce9178; border: none; padding: 6px;</string>
+          <property name="leftMargin">
+           <number>0</number>
           </property>
-         </widget>
+          <property name="topMargin">
+           <number>0</number>
+          </property>
+          <property name="rightMargin">
+           <number>0</number>
+          </property>
+          <property name="bottomMargin">
+           <number>0</number>
+          </property>
+          <item>
+           <layout class="QHBoxLayout" name="horizontalLayout_detailToolbar">
+            <property name="spacing">
+             <number>8</number>
+            </property>
+            <item>
+             <widget class="QLabel" name="detailPresetLabel">
+              <property name="text">
+               <string>完整预设：</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QComboBox" name="detailPresetCombo"/>
+            </item>
+            <item>
+             <widget class="QPushButton" name="editPresetButton">
+              <property name="text">
+               <string>编辑预设...</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QLabel" name="subtreeLevelLabel">
+              <property name="text">
+               <string>子树展开：</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QComboBox" name="subtreeLevelCombo">
+              <property name="editable">
+               <bool>true</bool>
+              </property>
+              <property name="toolTip">
+               <string>只控制展开到第几级，例如 3 / 5 / 12</string>
+              </property>
+              <item>
+               <property name="text">
+                <string>1</string>
+               </property>
+              </item>
+              <item>
+               <property name="text">
+                <string>2</string>
+               </property>
+              </item>
+              <item>
+               <property name="text">
+                <string>3</string>
+               </property>
+              </item>
+              <item>
+               <property name="text">
+                <string>4</string>
+               </property>
+              </item>
+              <item>
+               <property name="text">
+                <string>5</string>
+               </property>
+              </item>
+              <item>
+               <property name="text">
+                <string>6</string>
+               </property>
+              </item>
+              <item>
+               <property name="text">
+                <string>8</string>
+               </property>
+              </item>
+              <item>
+               <property name="text">
+                <string>10</string>
+               </property>
+              </item>
+              <item>
+               <property name="text">
+                <string>12</string>
+               </property>
+              </item>
+              <item>
+               <property name="text">
+                <string>15</string>
+               </property>
+              </item>
+              <item>
+               <property name="text">
+                <string>20</string>
+               </property>
+              </item>
+             </widget>
+            </item>
+            <item>
+             <spacer name="horizontalSpacer_detailToolbar">
+              <property name="orientation">
+               <enum>Qt::Horizontal</enum>
+              </property>
+              <property name="sizeHint" stdset="0">
+               <size>
+                <width>40</width>
+                <height>20</height>
+               </size>
+              </property>
+             </spacer>
+            </item>
+           </layout>
+          </item>
+          <item>
+           <widget class="QSplitter" name="detailVerticalSplitter">
+            <property name="orientation">
+             <enum>Qt::Vertical</enum>
+            </property>
+            <property name="childrenCollapsible">
+             <bool>false</bool>
+            </property>
+            <widget class="QTextEdit" name="detailText">
+             <property name="readOnly">
+              <bool>true</bool>
+             </property>
+             <property name="styleSheet">
+              <string notr="true">background: #1e1e1e; color: #ce9178; border: none; padding: 6px;</string>
+             </property>
+            </widget>
+            <widget class="QTreeWidget" name="detailTreeWidget">
+             <property name="alternatingRowColors">
+              <bool>true</bool>
+             </property>
+             <property name="uniformRowHeights">
+              <bool>true</bool>
+             </property>
+             <property name="styleSheet">
+              <string notr="true">QTreeWidget { background: #1e1e1e; color: #d4d4d4; border: none; font-size: 13px; } QTreeWidget::item:selected { background: #264f78; } QHeaderView::section { background: #2d2d2d; color: #ccc; padding: 4px; border: none; }</string>
+             </property>
+             <column>
+              <property name="text">
+               <string>name</string>
+              </property>
+             </column>
+             <column>
+              <property name="text">
+               <string>id</string>
+              </property>
+             </column>
+            </widget>
+           </widget>
+          </item>
+         </layout>
+        </widget>
         </widget>
        </item>
       </layout>

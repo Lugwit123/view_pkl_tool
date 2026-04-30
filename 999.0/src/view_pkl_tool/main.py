@@ -43,7 +43,6 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
-    QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
@@ -707,7 +706,7 @@ def _populate_detail_subtree_widget(
     max_nodes: int = _DETAIL_SUBTREE_MAX_NODES,
     display_fields: list[str] | None = None,
 ) -> None:
-    """将目录节点填充到右侧独立树控件。"""
+    """将任意对象填充到右侧独立树控件。"""
     tree.clear()
     leaf_fields = [f for f in (display_fields or ["name", "id"]) if f not in ("children", "categories")]
     if not leaf_fields:
@@ -716,16 +715,24 @@ def _populate_detail_subtree_widget(
         leaf_fields.append("id" if leaf_fields[0] != "id" else "")
     tree.setHeaderLabels([leaf_fields[0], leaf_fields[1]])
 
-    if not _is_tree_node_like(value):
-        QTreeWidgetItem(tree, ["当前选择不是目录节点", ""])
-        tree.expandAll()
-        return
-
     seen: set[int] = set()
     node_count = 0
     truncated = False
 
-    def walk(parent: QTreeWidget | QTreeWidgetItem, node: Any, depth: int) -> None:
+    def _format_cell(node: Any, field: str, *, key_hint: str | None, primary: bool) -> str:
+        if not field:
+            return ""
+        raw = _object_field_value(node, field)
+        if raw in (None, ""):
+            if primary:
+                if key_hint:
+                    return key_hint
+                return _node_label(node)
+            return _type_label(node)
+        text = str(raw).strip()
+        return text if text else (_node_label(node) if primary else _type_label(node))
+
+    def walk(parent: QTreeWidget | QTreeWidgetItem, node: Any, depth: int, key_hint: str | None) -> None:
         nonlocal node_count, truncated
         if truncated:
             return
@@ -733,11 +740,12 @@ def _populate_detail_subtree_widget(
             QTreeWidgetItem(parent, ["… (max depth reached)", ""])
             truncated = True
             return
-        nid = id(node)
-        if nid in seen:
-            QTreeWidgetItem(parent, ["… (cycle)", ""])
-            return
-        seen.add(nid)
+        if _is_container(node):
+            nid = id(node)
+            if nid in seen:
+                QTreeWidgetItem(parent, ["… (cycle)", ""])
+                return
+            seen.add(nid)
 
         node_count += 1
         if node_count > max_nodes:
@@ -745,26 +753,30 @@ def _populate_detail_subtree_widget(
             truncated = True
             return
 
-        first = _object_field_value(node, leaf_fields[0])
-        second = _object_field_value(node, leaf_fields[1]) if leaf_fields[1] else ""
+        first = _format_cell(node, leaf_fields[0], key_hint=key_hint, primary=True)
+        second = _format_cell(node, leaf_fields[1], key_hint=key_hint, primary=False) if leaf_fields[1] else ""
         item = QTreeWidgetItem(
             parent,
             [
-                str(first).strip() if first not in (None, "") else "<no-value>",
-                str(second).strip() if second not in (None, "") else "",
+                first or "<no-value>",
+                second or "",
             ],
         )
-        children = _tree_node_children(node)
-        if not isinstance(children, list) or not children:
-            return
-        for child in children:
-            child_name = _tree_node_name(child)
-            if child_name is not None:
-                walk(item, child, depth + 1)
-            else:
-                QTreeWidgetItem(item, [f"<{_type_label(child)}>", ""])
 
-    walk(tree, value, 0)
+        if _is_tree_node_like(node):
+            children = _tree_node_children(node)
+            if not isinstance(children, list) or not children:
+                return
+            for idx, child in enumerate(children):
+                child_name = _tree_node_name(child) or f"[{idx}]"
+                walk(item, child, depth + 1, child_name)
+            return
+
+        children = list(_iter_children(node))
+        for k, child in children:
+            walk(item, child, depth + 1, str(k))
+
+    walk(tree, value, 0, "root")
     tree.expandToDepth(min(max_depth, 2))
 
 
@@ -1887,42 +1899,18 @@ class PklViewer(QMainWindow):
             self._on_history_remove
         )
 
-        # 顶栏增加“重启程序”按钮（不修改 .ui，运行时插入到 toolbar 布局）
-        try:
-            toolbar_lay = central.findChild(QHBoxLayout, "horizontalLayout_toolbar")
-            if isinstance(toolbar_lay, QHBoxLayout):
-                save_btn = QPushButton("保存", central)
-                save_btn.setToolTip("将当前替换结果保存回 PKL 文件")
-                save_btn.clicked.connect(self._on_save)
-                save_as_btn = QPushButton("另存为...", central)
-                save_as_btn.setToolTip("将当前数据另存为 PKL 或 Fory 文件")
-                save_as_btn.clicked.connect(self._on_save_as)
-                force_check = QCheckBox("强制回写", central)
-                force_check.setToolTip(
-                    "允许在兼容模式下替换并保存（高风险：可能破坏原始数据结构，建议只用“另存为”）"
-                )
-                force_check.setChecked(True)
-                force_check.stateChanged.connect(self._on_force_writeback_changed)
-                restart_btn = QPushButton("重启程序", central)
-                restart_btn.setToolTip("重新拉起当前程序并退出（用于热更新 UI/代码）")
-                restart_btn.clicked.connect(self._on_restart_app)
-                insert_idx = toolbar_lay.indexOf(reload_btn) + 1
-                try:
-                    toolbar_lay.insertWidget(insert_idx, save_btn)
-                    toolbar_lay.insertWidget(insert_idx + 1, save_as_btn)
-                    toolbar_lay.insertWidget(insert_idx + 2, force_check)
-                    toolbar_lay.insertWidget(insert_idx + 3, restart_btn)
-                except Exception:
-                    toolbar_lay.addWidget(save_btn)
-                    toolbar_lay.addWidget(save_as_btn)
-                    toolbar_lay.addWidget(force_check)
-                    toolbar_lay.addWidget(restart_btn)
-                self._save_btn = save_btn
-                self._save_as_btn = save_as_btn
-                self._force_writeback_check = force_check
-        except Exception:
-            traceback.print_exc()
-            _log_exception("插入重启按钮失败")
+        self._save_btn = _require_ui_child(central, QPushButton, "saveButton")
+        self._save_btn.clicked.connect(self._on_save)
+        self._save_as_btn = _require_ui_child(central, QPushButton, "saveAsButton")
+        self._save_as_btn.clicked.connect(self._on_save_as)
+        self._force_writeback_check = _require_ui_child(
+            central, QCheckBox, "forceWritebackCheck"
+        )
+        self._force_writeback_check.setChecked(self._force_writeback)
+        self._force_writeback_check.stateChanged.connect(self._on_force_writeback_changed)
+        _require_ui_child(central, QPushButton, "restartButton").clicked.connect(
+            self._on_restart_app
+        )
 
         self._main_tabs = _require_ui_child(central, QTabWidget, "mainTabs")
         self._tree = _require_ui_child(central, QTreeWidget, "treeWidget")
@@ -1961,64 +1949,21 @@ class PklViewer(QMainWindow):
             central, QPushButton, "searchNextButton"
         )
         self._search_next_btn.clicked.connect(self._on_tree_search_next)
-        try:
-            search_lay = central.findChild(QHBoxLayout, "horizontalLayout_search")
-            if isinstance(search_lay, QHBoxLayout):
-                # 用按钮替代字段名下拉（支持多选）
-                field_btn = QToolButton(central)
-                field_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-                field_btn.setToolTip("选择要匹配的字段名（可多选）；勾选【全部字段】表示不限制字段")
-                field_btn.setStyleSheet(
-                    "QToolButton { background: #2d2d2d; color: #d4d4d4; padding: 3px 10px; border: 1px solid #3c3c3c; } "
-                    "QToolButton:hover { background: #353535; } "
-                    "QToolButton:pressed { background: #3f3f3f; }"
-                )
-                menu = QMenu(field_btn)
-                menu.setStyleSheet(
-                    "QMenu { background: #2d2d2d; color: #d4d4d4; }"
-                    " QMenu::item:selected { background: #264f78; }"
-                )
-                field_btn.setMenu(menu)
-                self._search_field_btn = field_btn
-                self._search_field_menu = menu
-
-                # 放到原字段名下拉的位置（label_field 后面）
-                try:
-                    combo_idx = search_lay.indexOf(self._search_field_combo)
-                    if combo_idx >= 0:
-                        search_lay.insertWidget(combo_idx, field_btn)
-                except Exception:
-                    pass
-
-                search_fields_btn = QPushButton("字段设置...", central)
-                search_fields_btn.setToolTip("设置字段名下拉框中的自定义枚举值")
-                search_fields_btn.clicked.connect(self._on_edit_search_fields)
-                replace_label = QLabel("替换为", central)
-                replace_label.setStyleSheet("color: #aaa; font-size: 12px;")
-                replace_line = QLineEdit(central)
-                replace_line.setPlaceholderText("支持留空，用于删除表情或其它文本")
-                replace_line.setStyleSheet(
-                    "QLineEdit { background: #2d2d2d; color: #d4d4d4; border: 1px solid #3c3c3c; padding: 4px 8px; }"
-                )
-                replace_line.returnPressed.connect(self._on_replace_all)
-                replace_btn = QPushButton("替换全部", central)
-                replace_btn.setStyleSheet(
-                    "QPushButton { background: #8b5cf6; color: #fff; padding: 4px 8px; border: none; } "
-                    "QPushButton:hover:enabled { background: #9d72ff; } "
-                    "QPushButton:pressed:enabled { background: #7447d6; } "
-                    "QPushButton:disabled { background: #4d3d70; color: #b9abd9; }"
-                )
-                replace_btn.clicked.connect(self._on_replace_all)
-                insert_idx = search_lay.indexOf(self._search_next_btn) + 1
-                search_lay.insertWidget(insert_idx, search_fields_btn)
-                search_lay.insertWidget(insert_idx + 1, replace_label)
-                search_lay.insertWidget(insert_idx + 2, replace_line, 1)
-                search_lay.insertWidget(insert_idx + 3, replace_btn)
-                self._replace_line = replace_line
-                self._replace_btn = replace_btn
-        except Exception:
-            traceback.print_exc()
-            _log_exception("插入替换控件失败")
+        self._search_field_btn = _require_ui_child(central, QToolButton, "searchFieldButton")
+        menu = QMenu(self._search_field_btn)
+        menu.setStyleSheet(
+            "QMenu { background: #2d2d2d; color: #d4d4d4; }"
+            " QMenu::item:selected { background: #264f78; }"
+        )
+        self._search_field_btn.setMenu(menu)
+        self._search_field_menu = menu
+        _require_ui_child(central, QPushButton, "searchFieldsButton").clicked.connect(
+            self._on_edit_search_fields
+        )
+        self._replace_line = _require_ui_child(central, QLineEdit, "replaceLine")
+        self._replace_line.returnPressed.connect(self._on_replace_all)
+        self._replace_btn = _require_ui_child(central, QPushButton, "replaceButton")
+        self._replace_btn.clicked.connect(self._on_replace_all)
 
         self._log_view = _require_ui_child(central, QTextEdit, "logView")
         log_hint = _require_ui_child(central, QLabel, "logHintLabel")
@@ -2034,80 +1979,30 @@ class PklViewer(QMainWindow):
         self._detail.setFont(QFont("Consolas", 12))
         self._log_view.setFont(QFont("Consolas", 10))
 
-        # 右侧详情：detailText 在 .ui 中是 QSplitter 的直接子控件，包一层容器后放入“文本预览 + 独立目录树”
-        try:
-            splitter = self._detail.parentWidget()
-            if isinstance(splitter, QSplitter):
-                idx = splitter.indexOf(self._detail)
-                self._detail.setParent(None)
-
-                detail_wrap = QWidget(splitter)
-                detail_wrap.setObjectName("detailWrap")
-                wrap_lay = QVBoxLayout(detail_wrap)
-                wrap_lay.setContentsMargins(0, 0, 0, 0)
-                wrap_lay.setSpacing(4)
-
-                bar = QWidget(detail_wrap)
-                bar_lay = QHBoxLayout(bar)
-                bar_lay.setContentsMargins(0, 0, 0, 0)
-                bar_lay.setSpacing(8)
-                bar_lay.addWidget(QLabel("完整预设：", bar))
-                detail_preset_combo = QComboBox(bar)
-                detail_preset_combo.currentIndexChanged.connect(
-                    lambda _idx: self._refresh_detail_from_current_item()
-                )
-                bar_lay.addWidget(detail_preset_combo, 1)
-
-                edit_preset_btn = QPushButton("编辑预设...", bar)
-                edit_preset_btn.clicked.connect(self._on_edit_detail_preset)
-                bar_lay.addWidget(edit_preset_btn)
-
-                bar_lay.addWidget(QLabel("子树展开：", bar))
-                level_combo = QComboBox(bar)
-                level_combo.setEditable(True)
-                level_combo.setToolTip("只控制展开到第几级，例如 3 / 5 / 12")
-                for level in _DETAIL_SUBTREE_LEVEL_PRESETS:
-                    level_combo.addItem(level)
-                level_combo.setCurrentText("12")
-                level_combo.currentIndexChanged.connect(
-                    lambda _idx: self._refresh_detail_from_current_item()
-                )
-                level_combo.editTextChanged.connect(
-                    lambda _text: self._refresh_detail_from_current_item()
-                )
-                bar_lay.addWidget(level_combo)
-                bar_lay.addStretch(1)
-
-                wrap_lay.addWidget(bar)
-                detail_splitter = QSplitter(Qt.Orientation.Vertical, detail_wrap)
-                detail_splitter.setChildrenCollapsible(False)
-                detail_splitter.addWidget(self._detail)
-
-                detail_tree = QTreeWidget(detail_splitter)
-                detail_tree.setObjectName("detailTreeWidget")
-                detail_tree.setAlternatingRowColors(True)
-                detail_tree.setUniformRowHeights(True)
-                detail_tree.setStyleSheet(
-                    "QTreeWidget { background: #1e1e1e; color: #d4d4d4; border: none; font-size: 13px; } "
-                    "QTreeWidget::item:selected { background: #264f78; } "
-                    "QHeaderView::section { background: #2d2d2d; color: #ccc; padding: 4px; border: none; }"
-                )
-                detail_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-                detail_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-                detail_tree.setHeaderLabels(["name", "id"])
-                detail_splitter.addWidget(detail_tree)
-                detail_splitter.setSizes([340, 260])
-
-                wrap_lay.addWidget(detail_splitter, 1)
-                splitter.insertWidget(idx, detail_wrap)
-                self._detail_splitter = detail_splitter
-                self._detail_preset_combo = detail_preset_combo
-                self._detail_tree = detail_tree
-                self._subtree_level_combo = level_combo
-                self._refresh_detail_preset_combo()
-        except Exception:
-            traceback.print_exc()
-            _log_exception("插入子树展开下拉框失败")
+        self._detail_splitter = _require_ui_child(central, QSplitter, "detailVerticalSplitter")
+        # detailTreeWidget 默认占约 2/3（上文本约 1/3）
+        self._set_detail_splitter_ratio(text_part=1, tree_part=2)
+        QTimer.singleShot(0, lambda: self._set_detail_splitter_ratio(text_part=1, tree_part=2))
+        self._detail_preset_combo = _require_ui_child(central, QComboBox, "detailPresetCombo")
+        self._detail_preset_combo.currentIndexChanged.connect(
+            lambda _idx: self._refresh_detail_from_current_item()
+        )
+        _require_ui_child(central, QPushButton, "editPresetButton").clicked.connect(
+            self._on_edit_detail_preset
+        )
+        self._subtree_level_combo = _require_ui_child(central, QComboBox, "subtreeLevelCombo")
+        self._subtree_level_combo.setCurrentText("12")
+        self._subtree_level_combo.currentIndexChanged.connect(
+            lambda _idx: self._refresh_detail_from_current_item()
+        )
+        self._subtree_level_combo.editTextChanged.connect(
+            lambda _text: self._refresh_detail_from_current_item()
+        )
+        self._detail_tree = _require_ui_child(central, QTreeWidget, "detailTreeWidget")
+        self._detail_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._detail_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self._detail_tree.setHeaderLabels(["name", "id"])
+        self._refresh_detail_preset_combo()
 
         self._reload_app_log_view()
 
@@ -2322,11 +2217,23 @@ class PklViewer(QMainWindow):
         splitter = self._detail_splitter
         if isinstance(splitter, QSplitter):
             if show_text and show_tree:
-                splitter.setSizes([340, 260])
+                self._set_detail_splitter_ratio(text_part=1, tree_part=2)
             elif show_text:
                 splitter.setSizes([1, 0])
             elif show_tree:
                 splitter.setSizes([0, 1])
+
+    def _set_detail_splitter_ratio(self, *, text_part: int, tree_part: int) -> None:
+        splitter = self._detail_splitter
+        if not isinstance(splitter, QSplitter):
+            return
+        splitter.setStretchFactor(0, max(1, int(text_part)))
+        splitter.setStretchFactor(1, max(1, int(tree_part)))
+        total = max(1, int(text_part) + int(tree_part))
+        base = max(300, splitter.size().height(), splitter.height())
+        text_size = max(1, (base * int(text_part)) // total)
+        tree_size = max(1, base - text_size)
+        splitter.setSizes([text_size, tree_size])
 
     def _set_detail_tree_message(self, text: str) -> None:
         tree = self._detail_tree
@@ -3178,7 +3085,7 @@ class PklViewer(QMainWindow):
         if value is None or value == _PLACEHOLDER:
             if bool(cfg.get("show_text", True)):
                 self._detail.setPlainText(current.text(1))
-            self._set_detail_tree_message("当前选择不是目录节点")
+            self._set_detail_tree_message("当前选择不支持树预览")
             return
         if isinstance(value, tuple) and len(value) == 3 and value[0] == "__more__":
             if bool(cfg.get("show_text", True)):
@@ -3218,7 +3125,15 @@ class PklViewer(QMainWindow):
                 if len(text) > _DETAIL_MAX_CHARS:
                     text = text[:_DETAIL_MAX_CHARS] + f"\n\n... (truncated, total {len(text)} chars)"
                 self._detail.setPlainText(text)
-            self._set_detail_tree_message("当前选择不是目录节点")
+            tree = self._detail_tree
+            if bool(cfg.get("show_tree", True)) and isinstance(tree, QTreeWidget):
+                _populate_detail_subtree_widget(
+                    tree,
+                    value,
+                    max_depth=max_depth,
+                    max_nodes=max_nodes,
+                    display_fields=cfg.get("tree_columns"),
+                )
         except Exception as e:
             traceback.print_exc()
             _log_exception("序列化详情视图失败")
