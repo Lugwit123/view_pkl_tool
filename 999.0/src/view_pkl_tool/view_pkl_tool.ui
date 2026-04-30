@@ -113,6 +113,16 @@
       </widget>
      </item>
      <item>
+      <widget class="QPushButton" name="settingsButton">
+       <property name="text">
+        <string>设置...</string>
+       </property>
+       <property name="toolTip">
+        <string>设置历史记录、完整预设、字段设置、日志等文件位置</string>
+       </property>
+      </widget>
+     </item>
+     <item>
       <spacer name="horizontalSpacer_toolbar">
        <property name="orientation">
         <enum>Qt::Horizontal</enum>

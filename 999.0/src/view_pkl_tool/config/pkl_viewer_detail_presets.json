@@ -1,0 +1,57 @@
+[
+  {
+    "name": "常用目录",
+    "show_text": true,
+    "text_mode": "recursive",
+    "show_tree": true,
+    "fields": [
+      "name",
+      "id",
+      "children",
+      "cache_path"
+    ],
+    "tree_columns": [
+      "name",
+      "id",
+      "cache_path"
+    ]
+  },
+  {
+    "name": "目录详情",
+    "show_text": true,
+    "text_mode": "recursive",
+    "show_tree": true,
+    "fields": [
+      "name",
+      "id",
+      "parent_id",
+      "children"
+    ],
+    "tree_columns": [
+      "name",
+      "id"
+    ]
+  },
+  {
+    "name": "文本摘要",
+    "show_text": true,
+    "text_mode": "shallow",
+    "show_tree": false,
+    "fields": null,
+    "tree_columns": [
+      "name",
+      "id"
+    ]
+  },
+  {
+    "name": "全部字段",
+    "show_text": true,
+    "text_mode": "recursive",
+    "show_tree": true,
+    "fields": null,
+    "tree_columns": [
+      "name",
+      "id"
+    ]
+  }
+]

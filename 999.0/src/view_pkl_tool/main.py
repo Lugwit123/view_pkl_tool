@@ -18,6 +18,7 @@ try:
 except ImportError:
     pyfory = None
     HAS_FORY = False
+import yaml
 import sys
 import traceback
 import types
@@ -43,6 +44,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
@@ -116,11 +118,80 @@ _MAX_CHILDREN = 60
 _BATCH_ADD_CHILDREN = 25
 _DETAIL_MAX_CHARS = 50_000
 _PLACEHOLDER = "__placeholder__"
-_HISTORY_FILE = Path(r"D:\Temp\pkl") / "pkl_viewer_history.json"
-_DETAIL_PRESET_FILE = Path(r"D:\Temp\pkl") / "pkl_viewer_detail_presets.json"
-_SEARCH_FIELD_PRESET_FILE = Path(r"D:\Temp\pkl") / "pkl_viewer_search_fields.json"
+_SETTINGS_DIR = Path(__file__).resolve().parent / "config"
+_APP_SETTINGS_FILE = _SETTINGS_DIR / "view_pkl_tool_settings.yaml"
+_LEGACY_APP_SETTINGS_FILE = _SETTINGS_DIR / "view_pkl_tool_settings.json"
 _HISTORY_MAX = 20
-_LOG_FILE = Path(r"D:\Temp\pkl") / "pkl_viewer.log"
+
+
+def _default_app_settings() -> dict[str, str]:
+    return {
+        "history_file": r"D:\Temp\pkl\pkl_viewer_history.json",
+        "user_settings_file": r"D:\Temp\pkl\pkl_viewer_user_settings.yaml",
+        "log_file": r"D:\Temp\pkl\pkl_viewer.log",
+    }
+
+
+def _read_mapping_file(path: Path) -> dict[str, Any]:
+    text = path.read_text(encoding="utf-8")
+    if path.suffix.lower() in (".yaml", ".yml"):
+        data = yaml.safe_load(text) or {}
+    else:
+        data = json.loads(text)
+    return data if isinstance(data, dict) else {}
+
+
+def _write_yaml_file(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+    yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+
+
+def _normalize_app_settings(raw: Any) -> dict[str, str]:
+    defaults = _default_app_settings()
+    src = raw if isinstance(raw, dict) else {}
+    result: dict[str, str] = {}
+    for key, default in defaults.items():
+        value = str(src.get(key) or default).strip()
+        if key == "user_settings_file" and Path(value).suffix.lower() == ".json":
+            value = str(Path(value).with_suffix(".yaml"))
+        result[key] = str(Path(value).expanduser())
+    return result
+
+
+def _load_app_settings() -> dict[str, str]:
+    try:
+        if _APP_SETTINGS_FILE.is_file():
+            return _normalize_app_settings(_read_mapping_file(_APP_SETTINGS_FILE))
+        if _LEGACY_APP_SETTINGS_FILE.is_file():
+            settings = _normalize_app_settings(_read_mapping_file(_LEGACY_APP_SETTINGS_FILE))
+            _save_app_settings(settings)
+            return settings
+    except Exception:
+        traceback.print_exc()
+    return _default_app_settings()
+
+
+def _save_app_settings(settings: dict[str, str]) -> None:
+    _write_yaml_file(_APP_SETTINGS_FILE, _normalize_app_settings(settings))
+
+
+def _apply_app_settings(settings: dict[str, str]) -> None:
+    global _APP_SETTINGS, _HISTORY_FILE, _USER_SETTINGS_FILE, _LOG_FILE
+    _APP_SETTINGS = _normalize_app_settings(settings)
+    _HISTORY_FILE = Path(_APP_SETTINGS["history_file"])
+    _USER_SETTINGS_FILE = Path(_APP_SETTINGS["user_settings_file"])
+    _LOG_FILE = Path(_APP_SETTINGS["log_file"])
+
+
+_APP_SETTINGS: dict[str, str] = {}
+_HISTORY_FILE = Path()
+_USER_SETTINGS_FILE = Path()
+_LOG_FILE = Path()
+_apply_app_settings(_load_app_settings())
 
 _LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -251,7 +322,7 @@ def _normalize_detail_preset(raw: Any) -> dict[str, Any]:
         "text_mode": text_mode,
         "show_tree": bool(src.get("show_tree", True)),
         "fields": _normalize_field_list(_field_list_to_text(src.get("fields"))),
-        "tree_columns": tree_columns[:2],
+        "tree_columns": tree_columns,
     }
 
 
@@ -301,7 +372,7 @@ class _DetailPresetEditorDialog(QDialog):
         form.addRow("文本字段", self.fields_edit)
 
         self.tree_columns_edit = QLineEdit(_field_list_to_text(preset.get("tree_columns")))
-        self.tree_columns_edit.setPlaceholderText("例如: name,id")
+        self.tree_columns_edit.setPlaceholderText("例如: name,id,cache_path 或 key,value,type")
         form.addRow("目录树列", self.tree_columns_edit)
 
         self.delete_requested = False
@@ -364,6 +435,97 @@ class _SearchFieldSettingsDialog(QDialog):
 
     def build_fields(self) -> list[str]:
         return _normalize_search_field_list(self.fields_edit.toPlainText())
+
+
+class _AppSettingsDialog(QDialog):
+    _LABELS = {
+        "history_file": "历史记录文件",
+        "user_settings_file": "预设/字段设置文件",
+        "log_file": "日志文件",
+    }
+
+    def __init__(self, parent: QWidget, settings: dict[str, str]) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("view_pkl_tool 设置")
+        self.resize(760, 260)
+        self._edits: dict[str, QLineEdit] = {}
+
+        layout = QVBoxLayout(self)
+        hint = QLabel(
+            f"设置文件位置。程序设置本身保存到：\n{_APP_SETTINGS_FILE}\n"
+            "保存后会立即切换到新位置；不存在的文件会在下次保存时创建。"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        form = QFormLayout()
+        layout.addLayout(form)
+        for key, label in self._LABELS.items():
+            row = QWidget(self)
+            row_lay = QHBoxLayout(row)
+            row_lay.setContentsMargins(0, 0, 0, 0)
+            edit = QLineEdit(str(settings.get(key) or _default_app_settings()[key]), row)
+            browse = QPushButton("浏览...", row)
+            browse.clicked.connect(lambda _checked=False, k=key: self._browse_file(k))
+            edit_btn = QPushButton("编辑...", row)
+            edit_btn.setToolTip("打开当前路径对应的文件；文件不存在时会先创建")
+            edit_btn.clicked.connect(lambda _checked=False, k=key: self._edit_file(k))
+            row_lay.addWidget(edit, 1)
+            row_lay.addWidget(edit_btn)
+            row_lay.addWidget(browse)
+            form.addRow(label, row)
+            self._edits[key] = edit
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _browse_file(self, key: str) -> None:
+        edit = self._edits[key]
+        current = Path(edit.text().strip() or _default_app_settings()[key])
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            f"选择{self._LABELS.get(key, key)}",
+            str(current),
+            "YAML 文件 (*.yaml *.yml);;JSON 文件 (*.json);;日志文件 (*.log);;所有文件 (*)",
+        )
+        if path:
+            if key == "user_settings_file" and Path(path).suffix.lower() == ".json":
+                path = str(Path(path).with_suffix(".yaml"))
+            edit.setText(path)
+
+    def _edit_file(self, key: str) -> None:
+        edit = self._edits[key]
+        path = Path(edit.text().strip() or _default_app_settings()[key]).expanduser()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.exists():
+                if key == "history_file":
+                    path.write_text("[]\n", encoding="utf-8")
+                elif key == "user_settings_file":
+                    _write_yaml_file(
+                        path,
+                        {
+                            "detail_presets": _clone_default_detail_presets(),
+                            "search_fields": [],
+                        },
+                    )
+                else:
+                    path.write_text("", encoding="utf-8")
+            if sys.platform.startswith("win"):
+                subprocess.Popen(["notepad.exe", str(path)])
+            else:
+                subprocess.Popen([str(path)])
+        except Exception as e:
+            QMessageBox.warning(self, "打开编辑失败", f"无法打开文件：\n{path}\n\n{e}")
+
+    def build_settings(self) -> dict[str, str]:
+        return _normalize_app_settings(
+            {key: edit.text().strip() for key, edit in self._edits.items()}
+        )
 
 
 def _pick_name_from_multil(m: Any) -> str | None:
@@ -708,12 +870,16 @@ def _populate_detail_subtree_widget(
 ) -> None:
     """将任意对象填充到右侧独立树控件。"""
     tree.clear()
-    leaf_fields = [f for f in (display_fields or ["name", "id"]) if f not in ("children", "categories")]
-    if not leaf_fields:
-        leaf_fields = ["name", "id"]
-    if len(leaf_fields) == 1:
-        leaf_fields.append("id" if leaf_fields[0] != "id" else "")
-    tree.setHeaderLabels([leaf_fields[0], leaf_fields[1]])
+    columns = [f for f in (display_fields or ["name", "id"]) if f not in ("children", "categories")]
+    if not columns:
+        columns = ["name", "id"]
+    tree.setHeaderLabels(columns)
+    header = tree.header()
+    for i in range(len(columns)):
+        header.setSectionResizeMode(
+            i,
+            QHeaderView.ResizeMode.Stretch if i == 0 else QHeaderView.ResizeMode.ResizeToContents,
+        )
 
     seen: set[int] = set()
     node_count = 0
@@ -722,6 +888,15 @@ def _populate_detail_subtree_widget(
     def _format_cell(node: Any, field: str, *, key_hint: str | None, primary: bool) -> str:
         if not field:
             return ""
+        field_l = field.strip().lower()
+        if field_l in ("key", "字段"):
+            return key_hint or ""
+        if field_l in ("value", "值"):
+            return _node_label(node)
+        if field_l in ("type", "类型"):
+            return _type_label(node)
+        if key_hint and key_hint == field:
+            return _node_label(node)
         raw = _object_field_value(node, field)
         if raw in (None, ""):
             if primary:
@@ -737,31 +912,29 @@ def _populate_detail_subtree_widget(
         if truncated:
             return
         if depth > max_depth:
-            QTreeWidgetItem(parent, ["… (max depth reached)", ""])
+            QTreeWidgetItem(parent, ["… (max depth reached)"] + [""] * (len(columns) - 1))
             truncated = True
             return
         if _is_container(node):
             nid = id(node)
             if nid in seen:
-                QTreeWidgetItem(parent, ["… (cycle)", ""])
+                QTreeWidgetItem(parent, ["… (cycle)"] + [""] * (len(columns) - 1))
                 return
             seen.add(nid)
 
         node_count += 1
         if node_count > max_nodes:
-            QTreeWidgetItem(parent, [f"… (truncated, >{max_nodes} nodes)", ""])
+            QTreeWidgetItem(parent, [f"… (truncated, >{max_nodes} nodes)"] + [""] * (len(columns) - 1))
             truncated = True
             return
 
-        first = _format_cell(node, leaf_fields[0], key_hint=key_hint, primary=True)
-        second = _format_cell(node, leaf_fields[1], key_hint=key_hint, primary=False) if leaf_fields[1] else ""
-        item = QTreeWidgetItem(
-            parent,
-            [
-                first or "<no-value>",
-                second or "",
-            ],
-        )
+        row = [
+            _format_cell(node, field, key_hint=key_hint, primary=(i == 0))
+            for i, field in enumerate(columns)
+        ]
+        if row:
+            row[0] = row[0] or "<no-value>"
+        item = QTreeWidgetItem(parent, row)
 
         if _is_tree_node_like(node):
             children = _tree_node_children(node)
@@ -863,12 +1036,17 @@ class TolerantUnpickler(pickle.Unpickler):
             return missing_type
 
 
-def _build_logger() -> logging.Logger:
+def _build_logger(*, reset: bool = False) -> logging.Logger:
     logger = logging.getLogger("pkl_viewer")
     logger.setLevel(logging.INFO)
     logger.propagate = False
+    if reset:
+        for handler in list(logger.handlers):
+            logger.removeHandler(handler)
+            handler.close()
     if logger.handlers:
         return logger
+    _LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     file_handler = logging.FileHandler(str(_LOG_FILE), encoding="utf-8")
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(
@@ -1911,6 +2089,9 @@ class PklViewer(QMainWindow):
         _require_ui_child(central, QPushButton, "restartButton").clicked.connect(
             self._on_restart_app
         )
+        _require_ui_child(central, QPushButton, "settingsButton").clicked.connect(
+            self._on_app_settings
+        )
 
         self._main_tabs = _require_ui_child(central, QTabWidget, "mainTabs")
         self._tree = _require_ui_child(central, QTreeWidget, "treeWidget")
@@ -2070,6 +2251,39 @@ class PklViewer(QMainWindow):
         self._refresh_path_label()
         self._update_edit_action_state()
 
+    def _on_app_settings(self) -> None:
+        dlg = _AppSettingsDialog(self, _APP_SETTINGS)
+        if dlg.exec() != int(QDialog.DialogCode.Accepted):
+            return
+        settings = dlg.build_settings()
+        try:
+            _save_app_settings(settings)
+            _apply_app_settings(settings)
+            _LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            global _LOGGER
+            _LOGGER = _build_logger(reset=True)
+        except Exception as e:
+            traceback.print_exc()
+            QMessageBox.warning(
+                self,
+                "保存程序设置失败",
+                f"无法保存设置：\n{_APP_SETTINGS_FILE}\n\n{e}",
+            )
+            self._status.showMessage("程序设置保存失败", 5000)
+            return
+
+        # 立即使用新位置；不做旧路径兼容读取。
+        self._migrate_user_settings_to_yaml()
+        self._history = _History()
+        self._detail_presets = self._load_detail_presets()
+        self._custom_search_fields = self._load_search_field_presets()
+        self._refresh_history_list()
+        self._refresh_detail_preset_combo()
+        self._refresh_detail_from_current_item()
+        self._rebuild_search_field_combo()
+        self._reload_app_log_view()
+        self._status.showMessage(f"程序设置已保存: {_APP_SETTINGS_FILE}", 6000)
+
     def _current_file_path(self) -> str:
         return self._path_label.toolTip().strip()
 
@@ -2086,10 +2300,12 @@ class PklViewer(QMainWindow):
 
     def _load_detail_presets(self) -> list[dict[str, Any]]:
         try:
-            if _DETAIL_PRESET_FILE.is_file():
-                data = json.loads(_DETAIL_PRESET_FILE.read_text(encoding="utf-8"))
-                if isinstance(data, list):
-                    presets = [_normalize_detail_preset(item) for item in data]
+            self._migrate_user_settings_to_yaml()
+            if _USER_SETTINGS_FILE.is_file():
+                data = _read_mapping_file(_USER_SETTINGS_FILE)
+                items = data.get("detail_presets") if isinstance(data, dict) else None
+                if isinstance(items, list):
+                    presets = [_normalize_detail_preset(item) for item in items]
                     if presets:
                         return presets
         except Exception:
@@ -2097,22 +2313,33 @@ class PklViewer(QMainWindow):
             _log_exception("读取完整预设失败")
         return _clone_default_detail_presets()
 
+    def _load_user_settings_data(self) -> dict[str, Any]:
+        self._migrate_user_settings_to_yaml()
+        if not _USER_SETTINGS_FILE.is_file():
+            return {}
+        return _read_mapping_file(_USER_SETTINGS_FILE)
+
+    def _save_user_settings_data(self, data: dict[str, Any]) -> None:
+        _write_yaml_file(_USER_SETTINGS_FILE, data)
+
     def _save_detail_presets(self) -> None:
         try:
-            _DETAIL_PRESET_FILE.parent.mkdir(parents=True, exist_ok=True)
-            _DETAIL_PRESET_FILE.write_text(
-                json.dumps(self._detail_presets, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            data = self._load_user_settings_data()
+            data["detail_presets"] = self._detail_presets
+            data.setdefault("search_fields", self._custom_search_fields)
+            self._save_user_settings_data(data)
         except Exception:
             traceback.print_exc()
             _log_exception("保存完整预设失败")
+            raise
 
     def _load_search_field_presets(self) -> list[str]:
         try:
-            if _SEARCH_FIELD_PRESET_FILE.is_file():
-                data = json.loads(_SEARCH_FIELD_PRESET_FILE.read_text(encoding="utf-8"))
-                return _normalize_search_field_list(data)
+            self._migrate_user_settings_to_yaml()
+            if _USER_SETTINGS_FILE.is_file():
+                data = _read_mapping_file(_USER_SETTINGS_FILE)
+                if isinstance(data, dict):
+                    return _normalize_search_field_list(data.get("search_fields"))
         except Exception:
             traceback.print_exc()
             _log_exception("读取字段名设置失败")
@@ -2120,14 +2347,26 @@ class PklViewer(QMainWindow):
 
     def _save_search_field_presets(self) -> None:
         try:
-            _SEARCH_FIELD_PRESET_FILE.parent.mkdir(parents=True, exist_ok=True)
-            _SEARCH_FIELD_PRESET_FILE.write_text(
-                json.dumps(self._custom_search_fields, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            data = self._load_user_settings_data()
+            data.setdefault("detail_presets", self._detail_presets)
+            data["search_fields"] = self._custom_search_fields
+            self._save_user_settings_data(data)
         except Exception:
             traceback.print_exc()
             _log_exception("保存字段名设置失败")
+
+    def _migrate_user_settings_to_yaml(self) -> None:
+        if _USER_SETTINGS_FILE.is_file():
+            return
+        legacy = _USER_SETTINGS_FILE.with_suffix(".json")
+        if not legacy.is_file():
+            return
+        try:
+            data = _read_mapping_file(legacy)
+            _write_yaml_file(_USER_SETTINGS_FILE, data)
+        except Exception:
+            traceback.print_exc()
+            _log_exception(f"迁移用户设置到 YAML 失败: {legacy} -> {_USER_SETTINGS_FILE}")
 
     def _refresh_detail_preset_combo(self, selected_name: str | None = None) -> None:
         combo = getattr(self, "_detail_preset_combo", None)
@@ -2175,9 +2414,20 @@ class PklViewer(QMainWindow):
                 return
             if 0 <= idx < len(self._detail_presets):
                 self._detail_presets.pop(idx)
-                self._save_detail_presets()
+                try:
+                    self._save_detail_presets()
+                except Exception as e:
+                    QMessageBox.warning(
+                        self,
+                        "保存完整预设失败",
+                        f"无法保存到文件：\n{_USER_SETTINGS_FILE}\n\n{e}",
+                    )
+                    self._status.showMessage("完整预设保存失败", 5000)
+                    return
                 self._refresh_detail_preset_combo()
                 self._refresh_detail_from_current_item()
+                QTimer.singleShot(0, self._refresh_detail_from_current_item)
+                self._status.showMessage(f"完整预设已保存: {_USER_SETTINGS_FILE}", 5000)
             return
 
         updated = dlg.build_preset()
@@ -2185,9 +2435,20 @@ class PklViewer(QMainWindow):
             self._detail_presets[idx] = updated
         else:
             self._detail_presets.append(updated)
-        self._save_detail_presets()
+        try:
+            self._save_detail_presets()
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "保存完整预设失败",
+                f"无法保存到文件：\n{_USER_SETTINGS_FILE}\n\n{e}",
+            )
+            self._status.showMessage("完整预设保存失败", 5000)
+            return
         self._refresh_detail_preset_combo(str(updated.get("name") or ""))
         self._refresh_detail_from_current_item()
+        QTimer.singleShot(0, self._refresh_detail_from_current_item)
+        self._status.showMessage(f"完整预设已保存: {_USER_SETTINGS_FILE}", 5000)
 
     def _refresh_detail_from_current_item(self) -> None:
         """下拉框变化时，重绘当前选中项的右侧详情。"""
@@ -2241,14 +2502,18 @@ class PklViewer(QMainWindow):
             return
         preset = self._current_detail_preset()
         fields = preset.get("tree_columns")
-        leaf_fields = [f for f in (fields or ["name", "id"]) if f not in ("children", "categories")]
-        if not leaf_fields:
-            leaf_fields = ["name", "id"]
-        if len(leaf_fields) == 1:
-            leaf_fields.append("id" if leaf_fields[0] != "id" else "")
+        columns = [f for f in (fields or ["name", "id"]) if f not in ("children", "categories")]
+        if not columns:
+            columns = ["name", "id"]
         tree.clear()
-        tree.setHeaderLabels([leaf_fields[0], leaf_fields[1]])
-        QTreeWidgetItem(tree, [text, ""])
+        tree.setHeaderLabels(columns)
+        header = tree.header()
+        for i in range(len(columns)):
+            header.setSectionResizeMode(
+                i,
+                QHeaderView.ResizeMode.Stretch if i == 0 else QHeaderView.ResizeMode.ResizeToContents,
+            )
+        QTreeWidgetItem(tree, [text] + [""] * (len(columns) - 1))
         tree.expandAll()
 
     def _build_shallow_preview_text(self, value: Any, allowed_fields: set[str] | None = None) -> str:
