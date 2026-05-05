@@ -7,7 +7,9 @@ authors = ["Lugwit Team"]
 
 requires = [
     "python-3.12+<3.13",
-    "pyfory-999.0-py3.12"
+    "pyfory-999.0-py3.12",
+    "pyyaml",
+    "pyside6",
 ]
 
 build_command = False
